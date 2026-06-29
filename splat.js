@@ -251,6 +251,27 @@ function invert4(a) {
     ];
 }
 
+// Fixed world-space pivot for NNG building center
+const NNG_PIVOT = [-0.045, 0.116, 0.33];
+
+// Orbit camera around a fixed world point: T(P)·Ry(dx)·Rx(-dy)·T(-P)·inv
+function orbitPivot(inv, dxRad, dyRad) {
+    const [px, py, pz] = NNG_PIVOT;
+    const sx = Math.sin(dxRad), cx = Math.cos(dxRad);
+    const sy = Math.sin(-dyRad), cy = Math.cos(-dyRad);
+    // World-space Ry (horizontal orbit, keeps building upright)
+    const Ry = [cx, 0, -sx, 0,  0, 1, 0, 0,  sx, 0, cx, 0,  0, 0, 0, 1];
+    // World-space Rx (vertical elevation)
+    const Rx = [1, 0, 0, 0,  0, cy, sy, 0,  0, -sy, cy, 0,  0, 0, 0, 1];
+    const Tneg = [1,0,0,0, 0,1,0,0, 0,0,1,0, -px,-py,-pz,1];
+    const Tpos = [1,0,0,0, 0,1,0,0, 0,0,1,0,  px, py, pz,1];
+    let m = multiply4(Tneg, inv);
+    m = multiply4(Ry, m);
+    m = multiply4(Rx, m);
+    m = multiply4(Tpos, m);
+    return m;
+}
+
 function rotate4(a, rad, x, y, z) {
     let len = Math.hypot(x, y, z);
     x /= len;
@@ -989,11 +1010,7 @@ async function main() {
                 );
                 // inv[13] = preY;
             } else {
-                let d = 4;
-                inv = translate4(inv, 0, 0, d);
-                inv = rotate4(inv, -(e.deltaX * scale) / innerWidth, 0, 1, 0);
-                inv = rotate4(inv, (e.deltaY * scale) / innerHeight, 1, 0, 0);
-                inv = translate4(inv, 0, 0, -d);
+                inv = orbitPivot(inv, -(e.deltaX * scale) / innerWidth, (e.deltaY * scale) / innerHeight);
             }
 
             viewMatrix = invert4(inv);
@@ -1023,16 +1040,7 @@ async function main() {
             let inv = invert4(viewMatrix);
             let dx = (5 * (e.clientX - startX)) / innerWidth;
             let dy = (5 * (e.clientY - startY)) / innerHeight;
-            let d = 4;
-
-            inv = translate4(inv, 0, 0, d);
-            inv = rotate4(inv, dx, 0, 1, 0);
-            inv = rotate4(inv, -dy, 1, 0, 0);
-            inv = translate4(inv, 0, 0, -d);
-            // let postAngle = Math.atan2(inv[0], inv[10])
-            // inv = rotate4(inv, postAngle - preAngle, 0, 0, 1)
-            // console.log(postAngle)
-            viewMatrix = invert4(inv);
+            viewMatrix = invert4(orbitPivot(inv, dx, dy));
 
             startX = e.clientX;
             startY = e.clientY;
@@ -1091,16 +1099,7 @@ async function main() {
                 let inv = invert4(viewMatrix);
                 let dx = (4 * (e.touches[0].clientX - startX)) / innerWidth;
                 let dy = (4 * (e.touches[0].clientY - startY)) / innerHeight;
-
-                let d = 4;
-                inv = translate4(inv, 0, 0, d);
-                // inv = translate4(inv,  -x, -y, -z);
-                // inv = translate4(inv,  x, y, z);
-                inv = rotate4(inv, dx, 0, 1, 0);
-                inv = rotate4(inv, -dy, 1, 0, 0);
-                inv = translate4(inv, 0, 0, -d);
-
-                viewMatrix = invert4(inv);
+                viewMatrix = invert4(orbitPivot(inv, dx, dy));
 
                 startX = e.touches[0].clientX;
                 startY = e.touches[0].clientY;
