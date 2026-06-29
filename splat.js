@@ -732,8 +732,8 @@ void main () {
 
 `.trim();
 
-let defaultViewMatrix = [ // NNG isometric: cam at (4.86,4.12,-4.57) → building center, 30° above
-    0.707, -0.354, -0.612, 0,  0, 0.866, -0.5, 0,  0.707, 0.354, 0.612, 0,  -0.205, -0.23, 7.83, 1,
+let defaultViewMatrix = [ // NNG isometric: cam 4 units from building center (matches d=4 orbit pivot)
+    0.707, -0.354, -0.612, 0,  0, 0.866, -0.5, 0,  0.707, 0.354, 0.612, 0,  -0.201, -0.231, 3.826, 1,
 ];
 let viewMatrix = defaultViewMatrix;
 async function main() {
