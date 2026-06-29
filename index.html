@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gaussian Splat Banner</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #07070c;
+      font-family: 'Helvetica Neue', sans-serif;
+      color: #aaa;
+    }
+
+    #banner-wrap {
+      position: relative;
+      width: 100vw;
+      height: 20vh;
+      overflow: hidden;
+    }
+
+    #banner {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    #controls {
+      position: absolute;
+      bottom: 10px;
+      right: 14px;
+      display: flex;
+      gap: 8px;
+      z-index: 10;
+    }
+
+    .btn {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 4px 10px;
+      border-radius: 3px;
+      border: 1px solid rgba(255,255,255,0.15);
+      background: rgba(0,0,0,0.4);
+      color: rgba(255,255,255,0.5);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn:hover { border-color: rgba(255,255,255,0.4); color: #fff; }
+    .btn.active { border-color: rgba(120,180,255,0.6); color: rgba(160,210,255,0.9); }
+
+    #hint {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.12);
+      pointer-events: none;
+      transition: opacity 1s;
+    }
+
+    .page-content {
+      padding: 3rem 4rem;
+      max-width: 800px;
+    }
+    h1 { font-size: 1.4rem; color: #ddd; margin-bottom: 0.8rem; font-weight: 300; }
+    p { line-height: 1.7; font-size: 0.9rem; color: #666; }
+  </style>
+</head>
+<body>
+
+<div id="banner-wrap">
+  <canvas id="banner"></canvas>
+  <div id="hint">move cursor · click to burst</div>
+  <div id="controls">
+    <button class="btn active" id="btn-attract">attract</button>
+    <button class="btn" id="btn-repel">repel</button>
+    <button class="btn" id="btn-orbit">orbit</button>
+  </div>
+</div>
+
+<div class="page-content">
+  <h1>Gaussian Splat Banner</h1>
+  <p>Procedural Gaussian splats — each particle is an oriented ellipse with radial-gradient alpha falloff and additive blending. Mouse position drives attraction, repulsion, or orbital motion. Click anywhere in the banner to spawn a burst.</p>
+</div>
+
+<script>
+const canvas = document.getElementById('banner');
+const ctx    = canvas.getContext('2d');
+const hint   = document.getElementById('hint');
+
+let W, H;
+let mouse  = { x: -999, y: -999, down: false, inside: false };
+let mode   = 'attract'; // 'attract' | 'repel' | 'orbit'
+let interacted = false;
+
+// ─── resize ──────────────────────────────────────────────────────────────────
+function resize() {
+  const wrap = document.getElementById('banner-wrap');
+  W = canvas.width  = wrap.offsetWidth;
+  H = canvas.height = wrap.offsetHeight;
+}
+resize();
+window.addEventListener('resize', () => { resize(); initSplats(); });
+
+// ─── color palette ────────────────────────────────────────────────────────────
+const PALETTE = [
+  [100, 160, 255],   // cool blue
+  [140, 100, 255],   // violet
+  [200, 120, 255],   // purple
+  [ 80, 220, 200],   // teal
+  [255, 160, 100],   // amber accent
+  [160, 210, 255],   // sky
+];
+
+// ─── Splat class ──────────────────────────────────────────────────────────────
+class Splat {
+  constructor(spawnX, spawnY, burst = false) {
+    this.burst = burst;
+    this.init(spawnX, spawnY);
+  }
+
+  init(sx, sy) {
+    this.x  = sx !== undefined ? sx : Math.random() * W;
+    this.y  = sy !== undefined ? sy : Math.random() * H;
+
+    if (this.burst) {
+      const a = Math.random() * Math.PI * 2;
+      const spd = 1 + Math.random() * 3;
+      this.vx = Math.cos(a) * spd;
+      this.vy = Math.sin(a) * spd;
+    } else {
+      this.vx = (Math.random() - 0.5) * 0.5;
+      this.vy = (Math.random() - 0.5) * 0.3;
+    }
+
+    // ellipse
+    this.rx       = 12 + Math.random() * 50;
+    this.ry       = this.rx * (0.35 + Math.random() * 0.55);
+    this.angle    = Math.random() * Math.PI;
+    this.angleVel = (Math.random() - 0.5) * 0.008;
+
+    // color
+    const col    = PALETTE[Math.floor(Math.random() * PALETTE.length)];
+    this.r = col[0]; this.g = col[1]; this.b = col[2];
+    this.baseAlpha = 0.08 + Math.random() * 0.22;
+
+    // life
+    this.life    = 0;
+    this.maxLife = this.burst
+      ? 100 + Math.random() * 150
+      : 300 + Math.random() * 600;
+    this.alpha   = 0;
+  }
+
+  update() {
+    this.life++;
+    this.angle += this.angleVel;
+
+    // fade envelope
+    const t = this.life / this.maxLife;
+    const fade = t < 0.12 ? t / 0.12 : t > 0.75 ? (1 - t) / 0.25 : 1;
+    this.alpha = this.baseAlpha * fade;
+
+    // mouse interaction
+    const dx   = mouse.x - this.x;
+    const dy   = mouse.y - this.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
+    const R    = mouse.down ? 220 : 140;
+
+    if (dist < R && mouse.inside) {
+      const strength = (1 - dist / R);
+
+      if (mode === 'attract') {
+        const f = strength * (mouse.down ? 0.18 : 0.04);
+        this.vx += (dx / dist) * f;
+        this.vy += (dy / dist) * f;
+
+      } else if (mode === 'repel') {
+        const f = strength * (mouse.down ? 0.25 : 0.06);
+        this.vx -= (dx / dist) * f;
+        this.vy -= (dy / dist) * f;
+
+      } else if (mode === 'orbit') {
+        // perpendicular push
+        const f = strength * 0.05;
+        this.vx += (-dy / dist) * f;
+        this.vy += ( dx / dist) * f;
+        // slight inward pull to keep orbit stable
+        this.vx += (dx / dist) * strength * 0.01;
+        this.vy += (dy / dist) * strength * 0.01;
+      }
+    }
+
+    // damping + drift
+    this.vx *= 0.97;
+    this.vy *= 0.97;
+    this.x  += this.vx;
+    this.y  += this.vy;
+
+    // out of bounds → recycle
+    if (
+      this.life > this.maxLife ||
+      this.x < -120 || this.x > W + 120 ||
+      this.y < -120 || this.y > H + 120
+    ) {
+      this.burst = false;
+      this.init();
+    }
+  }
+
+  draw() {
+    if (this.alpha <= 0) return;
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.angle);
+    ctx.scale(1, this.ry / this.rx);
+
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, this.rx);
+    g.addColorStop(0,    `rgba(${this.r},${this.g},${this.b},${this.alpha})`);
+    g.addColorStop(0.45, `rgba(${this.r},${this.g},${this.b},${this.alpha * 0.3})`);
+    g.addColorStop(1,    `rgba(${this.r},${this.g},${this.b},0)`);
+
+    ctx.beginPath();
+    ctx.arc(0, 0, this.rx, 0, Math.PI * 2);
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ─── init pool ───────────────────────────────────────────────────────────────
+let splats = [];
+
+function initSplats() {
+  splats = [];
+  const n = Math.min(Math.floor((W * H) / 3200), 220);
+  for (let i = 0; i < n; i++) splats.push(new Splat());
+}
+initSplats();
+
+// ─── mouse ───────────────────────────────────────────────────────────────────
+canvas.addEventListener('mousemove', e => {
+  const r  = canvas.getBoundingClientRect();
+  mouse.x  = e.clientX - r.left;
+  mouse.y  = e.clientY - r.top;
+  mouse.inside = true;
+  if (!interacted) { hint.style.opacity = '0'; interacted = true; }
+});
+canvas.addEventListener('mousedown', () => { mouse.down = true; });
+canvas.addEventListener('mouseup',   () => { mouse.down = false; });
+canvas.addEventListener('mouseleave',() => { mouse.inside = false; mouse.down = false; });
+
+canvas.addEventListener('click', e => {
+  const r = canvas.getBoundingClientRect();
+  const bx = e.clientX - r.left;
+  const by = e.clientY - r.top;
+  for (let i = 0; i < 12; i++) splats.push(new Splat(bx, by, true));
+});
+
+// ─── mode buttons ────────────────────────────────────────────────────────────
+['attract','repel','orbit'].forEach(m => {
+  const btn = document.getElementById(`btn-${m}`);
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    mode = m;
+    document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  });
+});
+
+// ─── render loop ─────────────────────────────────────────────────────────────
+function frame() {
+  // soft trail (motion-blur feel)
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = 'rgba(7, 7, 12, 0.18)';
+  ctx.fillRect(0, 0, W, H);
+
+  // additive blending → luminous overlaps
+  ctx.globalCompositeOperation = 'lighter';
+
+  for (const s of splats) {
+    s.update();
+    s.draw();
+  }
+
+  requestAnimationFrame(frame);
+}
+
+frame();
+</script>
+</body>
+</html>
