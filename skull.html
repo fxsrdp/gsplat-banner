@@ -26,60 +26,50 @@
 <div id="info">Paranasal Sinuses · Airway Simulation · drag to orbit · scroll to zoom</div>
 <a href="index.html" id="back">← back</a>
 <div id="legend">
-  <span style="color:#3890ff">●</span> Sinus Maxillaris L/R<br>
-  <span style="color:#50dba0">●</span> Sinus Frontalis<br>
-  <span style="color:#b84fff">●</span> Sinus Sphenoidalis / Ethmoidalis
+  <span style="color:#4bb8ff">●</span> Inhale (Einatmen)<br>
+  <span style="color:#ff8c42">●</span> Exhale (Ausatmen)<br>
+  <span style="color:#3890ff">■</span> Sinus Maxillaris<br>
+  <span style="color:#50dba0">■</span> Sinus Frontalis<br>
+  <span style="color:#b84fff">■</span> Sinus Sphenoidalis / Ethmoidalis
 </div>
 <script>
 // ── CONFIG ───────────────────────────────────────────────────────────────────
-// Coordinate system: Y=up, Z=forward (nose), X=right
-// Head ~2 units tall (-1 chin, +1 crown), ~1.5 wide, ~1.8 deep
-const N         = 2000;   // max airflow particles
-const SKULL_N   = 7000;   // static skull point cloud slots
+const N         = 2000;
+const SKULL_N   = 35000;   // 5× detail
 const TOTAL_MAX = SKULL_N + N;
 const EMIT      = 5;
 const MAX_AGE   = 260;
-const P_SCALE   = 0.028;  // particle Gaussian radius
-const BONE_S    = 0.016;  // skull surface splat radius
-const SIN_S     = 0.042;  // sinus volume splat radius
+const P_SCALE   = 0.026;
+const BONE_S    = 0.013;
+const SIN_S     = 0.036;
 const DAMP      = 0.87;
 const G_WP      = 0.012;
 const THRESH    = 0.11;
+const CLIP_Y    = -0.10;   // world-Y skull clip plane (hides lower face/jaw)
 
-const PIVOT = [0, 0.05, 0.3]; // look-at center (mid-face)
+// 2 airflow colors: cool blue inhale, warm orange exhale
+const INHALE_RGB = [75, 180, 255];
+const EXHALE_RGB = [255, 140, 50];
+
+const PIVOT = [0, 0.05, 0.3];
 
 // ── AIRWAY PATHS ─────────────────────────────────────────────────────────────
-// 4 routes — CT-atlas calibrated (1 unit = 75mm, see initSkull sinus positions)
-// nostril → nasal cavity → ostiomeatal complex / superior meatus → sinus
 const PATHS = [
-  // Sinus Maxillaris L — largest, most airflow, drains via OMC
   [[0.04,-0.27,0.73],[0,-0.13,0.55],[ 0.10,0.03,0.22],[ 0.35,-0.07,0.25]],
-  // Sinus Maxillaris R
   [[-0.04,-0.27,0.73],[0,-0.13,0.55],[-0.10,0.03,0.22],[-0.35,-0.07,0.25]],
-  // Sinus Frontalis — via frontal recess into middle meatus
   [[0,-0.27,0.73],[0,-0.05,0.50],[0.08,0.12,0.37],[ 0.20,0.52,0.47]],
-  // Sinus Sphenoidalis — via superior meatus / sphenoethmoidal recess (deep)
   [[0,-0.27,0.73],[0, 0.05,0.48],[0,0.12,0.30],[0,0.17,-0.03]],
 ];
-
-// Spawn probability weights (maxillary is dominant flow path)
-const PATH_W = [0.38, 0.38, 0.14, 0.10];
+const PATH_W    = [0.38, 0.38, 0.14, 0.10];
 const PATH_CUMW = (() => { let s=0; return PATH_W.map(w=>s+=w); })();
-
-// Particle colors per path [R,G,B]
-const PATH_RGB = [
-  [45,130,255],  // maxillary L
-  [65,175,255],  // maxillary R
-  [75,218,160],  // frontal
-  [175,70,255],  // sphenoid
-];
 
 // ── PARTICLE STATE ────────────────────────────────────────────────────────────
 const px=new Float32Array(N), py=new Float32Array(N), pz=new Float32Array(N);
 const vx=new Float32Array(N), vy=new Float32Array(N), vz=new Float32Array(N);
-const age  =new Int32Array(N);
-const stage=new Uint8Array(N);
-const pth  =new Uint8Array(N);
+const age       = new Int32Array(N);
+const stage     = new Uint8Array(N);
+const pth       = new Uint8Array(N);
+const driftLife = new Int32Array(N);   // exhale-drift countdown (>0 = drifting)
 let cursor=0;
 
 function pickPath(){
@@ -94,13 +84,11 @@ function spawn(){
     while(age[cursor]>0 && t++<N) cursor=(cursor+1)%N;
     if(age[cursor]>0) return;
     const i=cursor; cursor=(cursor+1)%N;
-
     const p=pickPath();
     const w0=PATHS[p][0];
     px[i]=w0[0]+(Math.random()-.5)*.07;
     py[i]=w0[1]+(Math.random()-.5)*.04;
     pz[i]=w0[2]+(Math.random()-.5)*.04;
-
     const w1=PATHS[p][1];
     const dx=w1[0]-px[i],dy=w1[1]-py[i],dz=w1[2]-pz[i];
     const r=Math.sqrt(dx*dx+dy*dy+dz*dz)||1;
@@ -108,8 +96,7 @@ function spawn(){
     vx[i]=dx/r*sp+(Math.random()-.5)*.009;
     vy[i]=dy/r*sp+(Math.random()-.5)*.005;
     vz[i]=dz/r*sp+(Math.random()-.5)*.009;
-
-    age[i]=1; stage[i]=0; pth[i]=p;
+    age[i]=1; stage[i]=0; pth[i]=p; driftLife[i]=0;
   }
 }
 
@@ -117,8 +104,31 @@ function stepPhysics(){
   spawn();
   for(let i=0;i<N;i++){
     if(age[i]<=0) continue;
+    age[i]++;
+
+    // ── Exhale drift (after sinus path complete) ──────────────────────────────
+    if(driftLife[i]>0){
+      vy[i] -= 0.0018;        // gravity
+      vx[i] *= 0.95;
+      vy[i] *= 0.97;
+      vz[i] *= 0.95;
+      px[i]+=vx[i]; py[i]+=vy[i]; pz[i]+=vz[i];
+      driftLife[i]--;
+      if(driftLife[i]<=0){ age[i]=0; driftLife[i]=0; }
+      continue;
+    }
+
+    // ── Inhale: follow sinus path ─────────────────────────────────────────────
     const wps=PATHS[pth[i]];
-    if(++age[i]>MAX_AGE || stage[i]>=wps.length){ age[i]=0; continue; }
+    if(stage[i]>=wps.length){
+      // Enter exhale drift with random lifetime
+      driftLife[i]=(45+Math.random()*90)|0;
+      vx[i]+=(Math.random()-.5)*.008;
+      vy[i]-=0.004;
+      vz[i]+=(Math.random()-.5)*.008;
+      continue;
+    }
+    if(age[i]>MAX_AGE){ age[i]=0; continue; }
     const wp=wps[stage[i]];
     const dx=wp[0]-px[i],dy=wp[1]-py[i],dz=wp[2]-pz[i];
     const r=Math.sqrt(dx*dx+dy*dy+dz*dz+.015);
@@ -137,7 +147,6 @@ const sk_y=new Float32Array(SKULL_N);
 const sk_z=new Float32Array(SKULL_N);
 let SKULL_ACTUAL=0;
 
-// half-float
 const _fv=new Float32Array(1),_iv=new Int32Array(_fv.buffer);
 function f2h(f){_fv[0]=f;const v=_iv[0];const s=(v>>31)&1,e=(v>>23)&0xff,m=v&0x7fffff;
   if(e===0)return s<<15;if(e===255)return(s<<15)|(31<<10)|(m?1:0);
@@ -162,9 +171,9 @@ function sampleSurf(cx,cy,cz,rx,ry,rz,n,scale,col,flt){
   while(pts.length<n){
     const th=Math.acos(1-2*Math.random()),ph=2*Math.PI*Math.random();
     const st=Math.sin(th),ct=Math.cos(th);
-    const x=cx+rx*st*Math.cos(ph)+(Math.random()-.5)*.013;
-    const y=cy+ry*ct+(Math.random()-.5)*.013;
-    const z=cz+rz*st*Math.sin(ph)+(Math.random()-.5)*.013;
+    const x=cx+rx*st*Math.cos(ph)+(Math.random()-.5)*.009;
+    const y=cy+ry*ct+(Math.random()-.5)*.009;
+    const z=cz+rz*st*Math.sin(ph)+(Math.random()-.5)*.009;
     if(!flt||flt(x,y,z)) pts.push([x,y,z]);
   }
   return pts.map(p=>[...p,...col,scale]);
@@ -175,123 +184,118 @@ function sampleVol(cx,cy,cz,rx,ry,rz,n,scale,col){
   while(pts.length<n){
     const u=Math.random()*2-1,v=Math.random()*2-1,w=Math.random()*2-1;
     if(u*u+v*v+w*w>1) continue;
-    pts.push([cx+rx*u+(Math.random()-.5)*.01,
-              cy+ry*v+(Math.random()-.5)*.01,
-              cz+rz*w+(Math.random()-.5)*.01]);
+    pts.push([cx+rx*u+(Math.random()-.5)*.007,
+              cy+ry*v+(Math.random()-.5)*.007,
+              cz+rz*w+(Math.random()-.5)*.007]);
   }
   return pts.map(p=>[...p,...col,scale]);
 }
 
 function initSkull(){
-  // Colors [R,G,B,A]
-  const BN=[228,218,196,130]; // bone
-  const FC=[100,178,255,105]; // frontal
-  const MC=[45,125,255,120];  // maxillary
-  const EC=[75,212,210,95];   // ethmoid
-  const SC=[158,72,255,100];  // sphenoid
+  const BN=[228,218,196,130];
+  const FC=[100,178,255,105];
+  const MC=[45,125,255,120];
+  const EC=[75,212,210,95];
+  const SC=[158,72,255,100];
 
   let all=[];
 
-  // ── Neurocranium ─────────────────────────────────────────────────────────
-  // Cranial vault: prolate spheroid, slightly elongated front-to-back
-  all.push(...sampleSurf(0,0.1,0, .72,.90,.85, 2300, BONE_S, BN,
-    (x,y,z)=>y>-0.12)); // exclude lower face from cranium
+  // Cranial vault (5×)
+  all.push(...sampleSurf(0,0.1,0, .72,.90,.85, 11500, BONE_S, BN,
+    (x,y,z)=>y>-0.12));
 
-  // ── Viscerocranium (mid-face skeleton) ───────────────────────────────────
-  all.push(...sampleSurf(0,-0.20,0.42, .54,.44,.37, 900, BONE_S, BN,
-    (x,y,z)=>z>0.06 && y<0.10)); // front of face only
+  // Viscerocranium
+  all.push(...sampleSurf(0,-0.20,0.42, .54,.44,.37, 4500, BONE_S, BN,
+    (x,y,z)=>z>0.06 && y<0.10));
 
-  // ── Orbital rims (eye sockets) ────────────────────────────────────────────
+  // Orbital rims
   for(const sx of[-1,1]){
-    for(let a=0;a<90;a++){
-      const t=a/90*Math.PI*2;
-      const jx=(Math.random()-.5)*.015, jy=(Math.random()-.5)*.012;
-      all.push([sx*.285+Math.cos(t)*.135+jx, .225+Math.sin(t)*.095+jy, .650, ...BN, BONE_S]);
+    for(let a=0;a<450;a++){
+      const t=a/450*Math.PI*2;
+      all.push([sx*.285+Math.cos(t)*.135+(Math.random()-.5)*.010,
+                .225+Math.sin(t)*.095+(Math.random()-.5)*.009, .650, ...BN, BONE_S]);
     }
   }
 
-  // ── Nasal bridge + nasal bones ────────────────────────────────────────────
-  all.push(...sampleSurf(0,-0.09,0.74, .065,.115,.048, 110, BONE_S, BN));
+  // Nasal bridge
+  all.push(...sampleSurf(0,-0.09,0.74, .065,.115,.048, 550, BONE_S, BN));
 
-  // ── Pyriform aperture (nasal opening outline) ─────────────────────────────
-  for(let a=0;a<75;a++){
-    const t=(a/75)*(Math.PI*1.7)-Math.PI*.85;
-    const x=Math.sin(t)*.10+(Math.random()-.5)*.012;
-    const y=-0.15+Math.cos(t)*.15+(Math.random()-.5)*.01;
-    all.push([x,y,0.775,...BN,BONE_S*.8]);
+  // Pyriform aperture
+  for(let a=0;a<375;a++){
+    const t=(a/375)*(Math.PI*1.7)-Math.PI*.85;
+    all.push([Math.sin(t)*.10+(Math.random()-.5)*.009,
+              -0.15+Math.cos(t)*.15+(Math.random()-.5)*.008, 0.775, ...BN, BONE_S*.8]);
   }
 
-  // ── Zygomatic arches (cheekbones) ─────────────────────────────────────────
+  // Zygomatic arches
   for(const sx of[-1,1]){
-    for(let i=0;i<110;i++){
-      const t=i/110;
-      const x=sx*(0.295+t*.325), y=0.05-t*.130, z=0.625-t*.380;
-      all.push([x+(Math.random()-.5)*.018, y+(Math.random()-.5)*.018,
-                z+(Math.random()-.5)*.018,...BN,BONE_S]);
+    for(let i=0;i<550;i++){
+      const t=i/550;
+      all.push([sx*(0.295+t*.325)+(Math.random()-.5)*.013,
+                0.05-t*.130+(Math.random()-.5)*.013,
+                0.625-t*.380+(Math.random()-.5)*.013, ...BN, BONE_S]);
     }
   }
 
-  // ── Maxilla (upper jaw) ───────────────────────────────────────────────────
-  all.push(...sampleSurf(0,-0.39,0.54, .46,.09,.31, 320, BONE_S, BN,
+  // Maxilla
+  all.push(...sampleSurf(0,-0.39,0.54, .46,.09,.31, 1600, BONE_S, BN,
     (x,y,z)=>z>0.23 && y<-0.30));
 
-  // ── Mandible (lower jaw horseshoe) ───────────────────────────────────────
-  for(let i=0;i<180;i++){
-    const t=(i/180)*Math.PI*0.95-Math.PI*.475;
-    const x=Math.sin(t)*.455+(Math.random()-.5)*.018;
-    const z=Math.cos(t)*.340+0.365+(Math.random()-.5)*.014;
-    const y=-0.625+(Math.random()-.5)*.032;
-    all.push([x,y,z,...BN,BONE_S]);
+  // Mandible
+  for(let i=0;i<900;i++){
+    const t=(i/900)*Math.PI*0.95-Math.PI*.475;
+    all.push([Math.sin(t)*.455+(Math.random()-.5)*.013,
+              -0.625+(Math.random()-.5)*.026,
+              Math.cos(t)*.340+0.365+(Math.random()-.5)*.011, ...BN, BONE_S]);
   }
-  // Mandibular ramus (vertical sides)
+  // Mandibular ramus
   for(const sx of[-1,1]){
-    for(let i=0;i<65;i++){
-      const yv=-0.625+i/65*.52+(Math.random()-.5)*.020;
-      all.push([sx*.43+(Math.random()-.5)*.018, yv, 0.30+(Math.random()-.5)*.030,...BN,BONE_S]);
+    for(let i=0;i<325;i++){
+      all.push([sx*.43+(Math.random()-.5)*.013,
+                -0.625+i/325*.52+(Math.random()-.5)*.016,
+                0.30+(Math.random()-.5)*.022, ...BN, BONE_S]);
     }
   }
 
-  // ── Sphenoid greater wings (lateral skull base) ───────────────────────────
+  // Sphenoid greater wings
   for(const sx of[-1,1]){
-    for(let i=0;i<80;i++){
-      const t=i/80;
-      const x=sx*(0.55+t*.15), y=-0.05-t*.22, z=0.18-t*.28;
-      all.push([x+(Math.random()-.5)*.020, y+(Math.random()-.5)*.018,
-                z+(Math.random()-.5)*.020,...BN,BONE_S*.9]);
+    for(let i=0;i<400;i++){
+      const t=i/400;
+      all.push([sx*(0.55+t*.15)+(Math.random()-.5)*.016,
+                -0.05-t*.22+(Math.random()-.5)*.013,
+                0.18-t*.28+(Math.random()-.5)*.016, ...BN, BONE_S*.9]);
     }
   }
 
-  // ── SINUS CAVITIES — CT-atlas positions (1 unit = 75mm) ──────────────────
+  // Sinus Frontalis
+  all.push(...sampleVol(-0.20,0.52,0.47, .17,.16,.13, 1050, SIN_S, FC));
+  all.push(...sampleVol( 0.20,0.52,0.47, .17,.16,.13, 1050, SIN_S, FC));
 
-  // Sinus Frontalis — 10–15mm lateral of midline, 39mm above EAM, 35mm deep from glabella
-  all.push(...sampleVol(-0.20,0.52,0.47, .17,.16,.13, 210, SIN_S, FC));
-  all.push(...sampleVol( 0.20,0.52,0.47, .17,.16,.13, 210, SIN_S, FC));
+  // Sinus Maxillaris (largest)
+  all.push(...sampleVol(-0.35,-0.07,0.25, .155,.21,.235, 2250, SIN_S, MC));
+  all.push(...sampleVol( 0.35,-0.07,0.25, .155,.21,.235, 2250, SIN_S, MC));
 
-  // Sinus Maxillaris — 26mm lateral, 12mm above nasal floor, 25mm depth (LARGEST)
-  all.push(...sampleVol(-0.35,-0.07,0.25, .155,.21,.235, 450, SIN_S, MC));
-  all.push(...sampleVol( 0.35,-0.07,0.25, .155,.21,.235, 450, SIN_S, MC));
+  // Sinus Ethmoidalis
+  all.push(...sampleVol(-0.18,0.20,0.27, .075,.22,.20, 850, SIN_S*.65, EC));
+  all.push(...sampleVol( 0.18,0.20,0.27, .075,.22,.20, 850, SIN_S*.65, EC));
 
-  // Sinus Ethmoidalis — 18mm lateral (lamina papyracea), elongated block, 40mm tall
-  all.push(...sampleVol(-0.18,0.20,0.27, .075,.22,.20, 170, SIN_S*.65, EC));
-  all.push(...sampleVol( 0.18,0.20,0.27, .075,.22,.20, 170, SIN_S*.65, EC));
+  // Sinus Sphenoidalis
+  all.push(...sampleVol(0,0.17,-0.03, .23,.13,.18, 1175, SIN_S, SC));
 
-  // Sinus Sphenoidalis — midline, below sella (Y+0.17), posterior to nasal cavity (Z-0.03)
-  all.push(...sampleVol(0,0.17,-0.03, .23,.13,.18, 235, SIN_S, SC));
-
-  // ── Nasal septum & turbinate region ──────────────────────────────────────
-  for(let i=0;i<135;i++){
-    const t=i/135;
-    const y=-0.34+t*.52, z=0.74-t*.52;
-    all.push([0+(Math.random()-.5)*.008, y+(Math.random()-.5)*.015,
-              z+(Math.random()-.5)*.015,...BN,BONE_S*.65]);
+  // Nasal septum
+  for(let i=0;i<675;i++){
+    const t=i/675;
+    all.push([0+(Math.random()-.5)*.005,
+              -0.34+t*.52+(Math.random()-.5)*.010,
+              0.74-t*.52+(Math.random()-.5)*.010, ...BN, BONE_S*.65]);
   }
-  // Inferior turbinates (bilateral shelf)
+  // Inferior turbinates
   for(const sx of[-1,1]){
-    for(let i=0;i<60;i++){
-      const t=i/60;
-      const x=sx*(.06+t*.10), y=-0.22+t*.02, z=0.64-t*.32;
-      all.push([x+(Math.random()-.5)*.01, y+(Math.random()-.5)*.015,
-                z+(Math.random()-.5)*.015,...BN,BONE_S*.70]);
+    for(let i=0;i<300;i++){
+      const t=i/300;
+      all.push([sx*(.06+t*.10)+(Math.random()-.5)*.008,
+                -0.22+t*.02+(Math.random()-.5)*.010,
+                0.64-t*.32+(Math.random()-.5)*.010, ...BN, BONE_S*.70]);
     }
   }
 
@@ -308,15 +312,21 @@ const psig=4*P_SCALE*P_SCALE;
 const PCOV01=p2h(psig,0),PCOV23=p2h(0,psig),PCOV45=p2h(0,psig);
 
 function writeParticle(slot,i){
-  const a=age[i];
-  const fi=Math.min(1,a/22), fo=Math.min(1,(MAX_AGE-a)/55);
-  const alpha=(fi*fo*242)|0;
+  const inDrift=driftLife[i]>0;
+  let alpha;
+  if(inDrift){
+    alpha=(Math.min(1,driftLife[i]/30)*195)|0;
+  } else {
+    const a=age[i];
+    const fi=Math.min(1,a/22), fo=Math.min(1,(MAX_AGE-a)/55);
+    alpha=(fi*fo*242)|0;
+  }
+  const [br,bg,bb]=inDrift ? EXHALE_RGB : INHALE_RGB;
   const spd=Math.sqrt(vx[i]*vx[i]+vy[i]*vy[i]+vz[i]*vz[i]);
-  const t=Math.min(1,spd/.055);
-  const[br,bg,bb]=PATH_RGB[pth[i]];
-  const R=(br+t*(255-br)*.65)|0;
-  const G=(bg+t*(255-bg)*.38)|0;
-  const B=(bb+t*(255-bb)*.18)|0;
+  const t=Math.min(1,spd/.045);
+  const R=(br+t*(255-br)*.50)|0;
+  const G=(bg+t*(255-bg)*.30)|0;
+  const B=(bb+t*(255-bb)*.15)|0;
   _fv[0]=px[i];const bx=_iv[0]>>>0;
   _fv[0]=py[i];const by=_iv[0]>>>0;
   _fv[0]=pz[i];const bz=_iv[0]>>>0;
@@ -336,11 +346,17 @@ precision highp float; precision highp int;
 uniform highp usampler2D u_texture;
 uniform mat4 projection,view;
 uniform vec2 focal,viewport;
+uniform int u_skull_n;
+uniform float u_clip_world_y;
 in vec2 position; in int index;
 out vec4 vColor; out vec2 vPosition;
 void main(){
   uvec4 cen=texelFetch(u_texture,ivec2((uint(index)&0x3ffu)<<1,uint(index)>>10),0);
-  vec4 cam=view*vec4(uintBitsToFloat(cen.xyz),1.);
+  vec3 worldPos=uintBitsToFloat(cen.xyz);
+  if(index < u_skull_n && worldPos.y < u_clip_world_y){
+    gl_Position=vec4(0.,0.,2.,1.); return;
+  }
+  vec4 cam=view*vec4(worldPos,1.);
   vec4 p=projection*cam;
   float clip=1.2*p.w;
   if(p.z<-clip||p.x<-clip||p.x>clip||p.y<-clip||p.y>clip){gl_Position=vec4(0,0,2,1);return;}
@@ -389,10 +405,18 @@ gl.linkProgram(prog);
 if(!gl.getProgramParameter(prog,gl.LINK_STATUS))console.error(gl.getProgramInfoLog(prog));
 gl.useProgram(prog);
 
-const ul={proj:gl.getUniformLocation(prog,'projection'),view:gl.getUniformLocation(prog,'view'),
-  focal:gl.getUniformLocation(prog,'focal'),vp:gl.getUniformLocation(prog,'viewport'),
-  tex:gl.getUniformLocation(prog,'u_texture')};
-gl.uniform1i(ul.tex,0);
+const ul={
+  proj:  gl.getUniformLocation(prog,'projection'),
+  view:  gl.getUniformLocation(prog,'view'),
+  focal: gl.getUniformLocation(prog,'focal'),
+  vp:    gl.getUniformLocation(prog,'viewport'),
+  tex:   gl.getUniformLocation(prog,'u_texture'),
+  skulln:gl.getUniformLocation(prog,'u_skull_n'),
+  clipy: gl.getUniformLocation(prog,'u_clip_world_y'),
+};
+gl.uniform1i(ul.tex, 0);
+gl.uniform1i(ul.skulln, SKULL_N);
+gl.uniform1f(ul.clipy, CLIP_Y);
 
 const quadBuf=gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);
@@ -435,7 +459,6 @@ function orbitPivot(inv,dxR,dyR){
   let m=mul4(Tn,inv);m=mul4(Ry,m);m=mul4(Rx,m);return mul4(Tp,m);
 }
 
-// LH convention: forward in col2 un-negated
 function lookAt(ex,ey,ez,cx,cy,cz){
   const fx=cx-ex,fy=cy-ey,fz=cz-ez,fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
   const nx=fx/fl,ny=fy/fl,nz=fz/fl;
@@ -446,7 +469,6 @@ function lookAt(ex,ey,ez,cx,cy,cz){
     -(rx*ex+ry*ey+rz*ez),-(ux*ex+uy*ey+uz*ez),-(nx*ex+ny*ey+nz*ez),1];
 }
 
-// Default: 3/4 frontal view from in front (Z+), slightly elevated
 let viewMatrix=lookAt(1.2,0.5,5.0, PIVOT[0],PIVOT[1],PIVOT[2]);
 let projMatrix;
 
@@ -461,10 +483,9 @@ function resize(){
   gl.uniform2f(ul.focal,fx,fy);
   gl.uniform2f(ul.vp,innerWidth,innerHeight);
   gl.uniformMatrix4fv(ul.proj,false,projMatrix);
-  // allocate texture buffer: skull slots + particle slots
   const texH=Math.ceil(2*TOTAL_MAX/TEXW)+2;
   texdata=new Uint32Array(TEXW*texH*4);
-  initSkull(); // write static skull data into fresh texdata
+  initSkull();
 }
 window.addEventListener('resize',resize); resize();
 
@@ -505,25 +526,18 @@ const sortArr =new Int32Array(TOTAL_MAX);
 
 function buildAll(vp){
   let r=0;
-
-  // 1. Skull static points (always rendered, pre-written in texdata)
   for(let i=0;i<SKULL_ACTUAL;i++){
     depthBuf[i]=vp[2]*sk_x[i]+vp[6]*sk_y[i]+vp[10]*sk_z[i];
     sortArr[r++]=i;
   }
-
-  // 2. Live particles packed into slots SKULL_N..SKULL_N+alive-1
   let pp=SKULL_N;
   for(let i=0;i<N;i++){
     if(age[i]<=0) continue;
     writeParticle(pp,i);
     depthBuf[pp]=vp[2]*px[i]+vp[6]*py[i]+vp[10]*pz[i];
-    sortArr[r++]=pp;
-    pp++;
+    sortArr[r++]=pp; pp++;
   }
-
   const total=r;
-  // in-place sort of sortArr[0..total-1] by depth (ascending = back-to-front)
   sortArr.subarray(0,total).sort((a,b)=>depthBuf[a]-depthBuf[b]);
   return total;
 }
