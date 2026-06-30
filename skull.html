@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sinus Airways · Gaussian Splat</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#000; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; }
+    #info { position:fixed; bottom:16px; left:50%; transform:translateX(-50%);
+      font:11px/1 'Helvetica Neue',sans-serif; letter-spacing:.12em;
+      text-transform:uppercase; color:rgba(255,255,255,.20); pointer-events:none; white-space:nowrap; }
+    #fps { position:fixed; top:10px; left:10px; color:rgba(255,255,255,.15); font:10px monospace; }
+    #back { position:fixed; top:14px; left:50%; transform:translateX(-50%);
+      font:11px/1 'Helvetica Neue',sans-serif; letter-spacing:.1em; text-transform:uppercase;
+      color:rgba(255,255,255,.28); text-decoration:none; border:1px solid rgba(255,255,255,.10);
+      padding:4px 12px; border-radius:3px; }
+    #legend { position:fixed; bottom:44px; right:16px; font:9px/1.9 'Helvetica Neue',monospace;
+      color:rgba(255,255,255,.28); letter-spacing:.06em; text-align:right; }
+  </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="fps"></div>
+<div id="info">Paranasal Sinuses · Airway Simulation · drag to orbit · scroll to zoom</div>
+<a href="index.html" id="back">← back</a>
+<div id="legend">
+  <span style="color:#3890ff">●</span> Sinus Maxillaris L/R<br>
+  <span style="color:#50dba0">●</span> Sinus Frontalis<br>
+  <span style="color:#b84fff">●</span> Sinus Sphenoidalis / Ethmoidalis
+</div>
+<script>
+// ── CONFIG ───────────────────────────────────────────────────────────────────
+// Coordinate system: Y=up, Z=forward (nose), X=right
+// Head ~2 units tall (-1 chin, +1 crown), ~1.5 wide, ~1.8 deep
+const N         = 2000;   // max airflow particles
+const SKULL_N   = 7000;   // static skull point cloud slots
+const TOTAL_MAX = SKULL_N + N;
+const EMIT      = 5;
+const MAX_AGE   = 260;
+const P_SCALE   = 0.028;  // particle Gaussian radius
+const BONE_S    = 0.016;  // skull surface splat radius
+const SIN_S     = 0.042;  // sinus volume splat radius
+const DAMP      = 0.87;
+const G_WP      = 0.012;
+const THRESH    = 0.11;
+
+const PIVOT = [0, 0.05, 0.3]; // look-at center (mid-face)
+
+// ── AIRWAY PATHS ─────────────────────────────────────────────────────────────
+// 4 routes — CT-atlas calibrated (1 unit = 75mm, see initSkull sinus positions)
+// nostril → nasal cavity → ostiomeatal complex / superior meatus → sinus
+const PATHS = [
+  // Sinus Maxillaris L — largest, most airflow, drains via OMC
+  [[0.04,-0.27,0.73],[0,-0.13,0.55],[ 0.10,0.03,0.22],[ 0.35,-0.07,0.25]],
+  // Sinus Maxillaris R
+  [[-0.04,-0.27,0.73],[0,-0.13,0.55],[-0.10,0.03,0.22],[-0.35,-0.07,0.25]],
+  // Sinus Frontalis — via frontal recess into middle meatus
+  [[0,-0.27,0.73],[0,-0.05,0.50],[0.08,0.12,0.37],[ 0.20,0.52,0.47]],
+  // Sinus Sphenoidalis — via superior meatus / sphenoethmoidal recess (deep)
+  [[0,-0.27,0.73],[0, 0.05,0.48],[0,0.12,0.30],[0,0.17,-0.03]],
+];
+
+// Spawn probability weights (maxillary is dominant flow path)
+const PATH_W = [0.38, 0.38, 0.14, 0.10];
+const PATH_CUMW = (() => { let s=0; return PATH_W.map(w=>s+=w); })();
+
+// Particle colors per path [R,G,B]
+const PATH_RGB = [
+  [45,130,255],  // maxillary L
+  [65,175,255],  // maxillary R
+  [75,218,160],  // frontal
+  [175,70,255],  // sphenoid
+];
+
+// ── PARTICLE STATE ────────────────────────────────────────────────────────────
+const px=new Float32Array(N), py=new Float32Array(N), pz=new Float32Array(N);
+const vx=new Float32Array(N), vy=new Float32Array(N), vz=new Float32Array(N);
+const age  =new Int32Array(N);
+const stage=new Uint8Array(N);
+const pth  =new Uint8Array(N);
+let cursor=0;
+
+function pickPath(){
+  const r=Math.random();
+  for(let i=0;i<PATH_CUMW.length;i++) if(r<PATH_CUMW[i]) return i;
+  return PATH_CUMW.length-1;
+}
+
+function spawn(){
+  for(let k=0;k<EMIT;k++){
+    let t=0;
+    while(age[cursor]>0 && t++<N) cursor=(cursor+1)%N;
+    if(age[cursor]>0) return;
+    const i=cursor; cursor=(cursor+1)%N;
+
+    const p=pickPath();
+    const w0=PATHS[p][0];
+    px[i]=w0[0]+(Math.random()-.5)*.07;
+    py[i]=w0[1]+(Math.random()-.5)*.04;
+    pz[i]=w0[2]+(Math.random()-.5)*.04;
+
+    const w1=PATHS[p][1];
+    const dx=w1[0]-px[i],dy=w1[1]-py[i],dz=w1[2]-pz[i];
+    const r=Math.sqrt(dx*dx+dy*dy+dz*dz)||1;
+    const sp=0.016*(0.7+Math.random()*.6);
+    vx[i]=dx/r*sp+(Math.random()-.5)*.009;
+    vy[i]=dy/r*sp+(Math.random()-.5)*.005;
+    vz[i]=dz/r*sp+(Math.random()-.5)*.009;
+
+    age[i]=1; stage[i]=0; pth[i]=p;
+  }
+}
+
+function stepPhysics(){
+  spawn();
+  for(let i=0;i<N;i++){
+    if(age[i]<=0) continue;
+    const wps=PATHS[pth[i]];
+    if(++age[i]>MAX_AGE || stage[i]>=wps.length){ age[i]=0; continue; }
+    const wp=wps[stage[i]];
+    const dx=wp[0]-px[i],dy=wp[1]-py[i],dz=wp[2]-pz[i];
+    const r=Math.sqrt(dx*dx+dy*dy+dz*dz+.015);
+    if(r<THRESH) stage[i]++;
+    const f=G_WP/r;
+    vx[i]=(vx[i]+f*dx)*DAMP;
+    vy[i]=(vy[i]+f*dy)*DAMP;
+    vz[i]=(vz[i]+f*dz)*DAMP;
+    px[i]+=vx[i]; py[i]+=vy[i]; pz[i]+=vz[i];
+  }
+}
+
+// ── SKULL POINT CLOUD ─────────────────────────────────────────────────────────
+const sk_x=new Float32Array(SKULL_N);
+const sk_y=new Float32Array(SKULL_N);
+const sk_z=new Float32Array(SKULL_N);
+let SKULL_ACTUAL=0;
+
+// half-float
+const _fv=new Float32Array(1),_iv=new Int32Array(_fv.buffer);
+function f2h(f){_fv[0]=f;const v=_iv[0];const s=(v>>31)&1,e=(v>>23)&0xff,m=v&0x7fffff;
+  if(e===0)return s<<15;if(e===255)return(s<<15)|(31<<10)|(m?1:0);
+  const ne=e-127+15;if(ne>=31)return(s<<15)|(31<<10);if(ne<=0)return s<<15;
+  return(s<<15)|(ne<<10)|(m>>13);}
+function p2h(a,b){return(f2h(a)|(f2h(b)<<16))>>>0;}
+function covS(s){const g=4*s*s;return[p2h(g,0),p2h(0,g),p2h(0,g)];}
+
+function writeSplat(slot,x,y,z,scale,r,g,b,a){
+  _fv[0]=x;const bx=_iv[0]>>>0;
+  _fv[0]=y;const by=_iv[0]>>>0;
+  _fv[0]=z;const bz=_iv[0]>>>0;
+  const [c0,c1,c2]=covS(scale);
+  const base=slot*8;
+  texdata[base]=bx;texdata[base+1]=by;texdata[base+2]=bz;texdata[base+3]=0;
+  texdata[base+4]=c0;texdata[base+5]=c1;texdata[base+6]=c2;
+  texdata[base+7]=(r|(g<<8)|(b<<16)|(a<<24))>>>0;
+}
+
+function sampleSurf(cx,cy,cz,rx,ry,rz,n,scale,col,flt){
+  const pts=[];
+  while(pts.length<n){
+    const th=Math.acos(1-2*Math.random()),ph=2*Math.PI*Math.random();
+    const st=Math.sin(th),ct=Math.cos(th);
+    const x=cx+rx*st*Math.cos(ph)+(Math.random()-.5)*.013;
+    const y=cy+ry*ct+(Math.random()-.5)*.013;
+    const z=cz+rz*st*Math.sin(ph)+(Math.random()-.5)*.013;
+    if(!flt||flt(x,y,z)) pts.push([x,y,z]);
+  }
+  return pts.map(p=>[...p,...col,scale]);
+}
+
+function sampleVol(cx,cy,cz,rx,ry,rz,n,scale,col){
+  const pts=[];
+  while(pts.length<n){
+    const u=Math.random()*2-1,v=Math.random()*2-1,w=Math.random()*2-1;
+    if(u*u+v*v+w*w>1) continue;
+    pts.push([cx+rx*u+(Math.random()-.5)*.01,
+              cy+ry*v+(Math.random()-.5)*.01,
+              cz+rz*w+(Math.random()-.5)*.01]);
+  }
+  return pts.map(p=>[...p,...col,scale]);
+}
+
+function initSkull(){
+  // Colors [R,G,B,A]
+  const BN=[228,218,196,130]; // bone
+  const FC=[100,178,255,105]; // frontal
+  const MC=[45,125,255,120];  // maxillary
+  const EC=[75,212,210,95];   // ethmoid
+  const SC=[158,72,255,100];  // sphenoid
+
+  let all=[];
+
+  // ── Neurocranium ─────────────────────────────────────────────────────────
+  // Cranial vault: prolate spheroid, slightly elongated front-to-back
+  all.push(...sampleSurf(0,0.1,0, .72,.90,.85, 2300, BONE_S, BN,
+    (x,y,z)=>y>-0.12)); // exclude lower face from cranium
+
+  // ── Viscerocranium (mid-face skeleton) ───────────────────────────────────
+  all.push(...sampleSurf(0,-0.20,0.42, .54,.44,.37, 900, BONE_S, BN,
+    (x,y,z)=>z>0.06 && y<0.10)); // front of face only
+
+  // ── Orbital rims (eye sockets) ────────────────────────────────────────────
+  for(const sx of[-1,1]){
+    for(let a=0;a<90;a++){
+      const t=a/90*Math.PI*2;
+      const jx=(Math.random()-.5)*.015, jy=(Math.random()-.5)*.012;
+      all.push([sx*.285+Math.cos(t)*.135+jx, .225+Math.sin(t)*.095+jy, .650, ...BN, BONE_S]);
+    }
+  }
+
+  // ── Nasal bridge + nasal bones ────────────────────────────────────────────
+  all.push(...sampleSurf(0,-0.09,0.74, .065,.115,.048, 110, BONE_S, BN));
+
+  // ── Pyriform aperture (nasal opening outline) ─────────────────────────────
+  for(let a=0;a<75;a++){
+    const t=(a/75)*(Math.PI*1.7)-Math.PI*.85;
+    const x=Math.sin(t)*.10+(Math.random()-.5)*.012;
+    const y=-0.15+Math.cos(t)*.15+(Math.random()-.5)*.01;
+    all.push([x,y,0.775,...BN,BONE_S*.8]);
+  }
+
+  // ── Zygomatic arches (cheekbones) ─────────────────────────────────────────
+  for(const sx of[-1,1]){
+    for(let i=0;i<110;i++){
+      const t=i/110;
+      const x=sx*(0.295+t*.325), y=0.05-t*.130, z=0.625-t*.380;
+      all.push([x+(Math.random()-.5)*.018, y+(Math.random()-.5)*.018,
+                z+(Math.random()-.5)*.018,...BN,BONE_S]);
+    }
+  }
+
+  // ── Maxilla (upper jaw) ───────────────────────────────────────────────────
+  all.push(...sampleSurf(0,-0.39,0.54, .46,.09,.31, 320, BONE_S, BN,
+    (x,y,z)=>z>0.23 && y<-0.30));
+
+  // ── Mandible (lower jaw horseshoe) ───────────────────────────────────────
+  for(let i=0;i<180;i++){
+    const t=(i/180)*Math.PI*0.95-Math.PI*.475;
+    const x=Math.sin(t)*.455+(Math.random()-.5)*.018;
+    const z=Math.cos(t)*.340+0.365+(Math.random()-.5)*.014;
+    const y=-0.625+(Math.random()-.5)*.032;
+    all.push([x,y,z,...BN,BONE_S]);
+  }
+  // Mandibular ramus (vertical sides)
+  for(const sx of[-1,1]){
+    for(let i=0;i<65;i++){
+      const yv=-0.625+i/65*.52+(Math.random()-.5)*.020;
+      all.push([sx*.43+(Math.random()-.5)*.018, yv, 0.30+(Math.random()-.5)*.030,...BN,BONE_S]);
+    }
+  }
+
+  // ── Sphenoid greater wings (lateral skull base) ───────────────────────────
+  for(const sx of[-1,1]){
+    for(let i=0;i<80;i++){
+      const t=i/80;
+      const x=sx*(0.55+t*.15), y=-0.05-t*.22, z=0.18-t*.28;
+      all.push([x+(Math.random()-.5)*.020, y+(Math.random()-.5)*.018,
+                z+(Math.random()-.5)*.020,...BN,BONE_S*.9]);
+    }
+  }
+
+  // ── SINUS CAVITIES — CT-atlas positions (1 unit = 75mm) ──────────────────
+
+  // Sinus Frontalis — 10–15mm lateral of midline, 39mm above EAM, 35mm deep from glabella
+  all.push(...sampleVol(-0.20,0.52,0.47, .17,.16,.13, 210, SIN_S, FC));
+  all.push(...sampleVol( 0.20,0.52,0.47, .17,.16,.13, 210, SIN_S, FC));
+
+  // Sinus Maxillaris — 26mm lateral, 12mm above nasal floor, 25mm depth (LARGEST)
+  all.push(...sampleVol(-0.35,-0.07,0.25, .155,.21,.235, 450, SIN_S, MC));
+  all.push(...sampleVol( 0.35,-0.07,0.25, .155,.21,.235, 450, SIN_S, MC));
+
+  // Sinus Ethmoidalis — 18mm lateral (lamina papyracea), elongated block, 40mm tall
+  all.push(...sampleVol(-0.18,0.20,0.27, .075,.22,.20, 170, SIN_S*.65, EC));
+  all.push(...sampleVol( 0.18,0.20,0.27, .075,.22,.20, 170, SIN_S*.65, EC));
+
+  // Sinus Sphenoidalis — midline, below sella (Y+0.17), posterior to nasal cavity (Z-0.03)
+  all.push(...sampleVol(0,0.17,-0.03, .23,.13,.18, 235, SIN_S, SC));
+
+  // ── Nasal septum & turbinate region ──────────────────────────────────────
+  for(let i=0;i<135;i++){
+    const t=i/135;
+    const y=-0.34+t*.52, z=0.74-t*.52;
+    all.push([0+(Math.random()-.5)*.008, y+(Math.random()-.5)*.015,
+              z+(Math.random()-.5)*.015,...BN,BONE_S*.65]);
+  }
+  // Inferior turbinates (bilateral shelf)
+  for(const sx of[-1,1]){
+    for(let i=0;i<60;i++){
+      const t=i/60;
+      const x=sx*(.06+t*.10), y=-0.22+t*.02, z=0.64-t*.32;
+      all.push([x+(Math.random()-.5)*.01, y+(Math.random()-.5)*.015,
+                z+(Math.random()-.5)*.015,...BN,BONE_S*.70]);
+    }
+  }
+
+  SKULL_ACTUAL=Math.min(all.length,SKULL_N);
+  for(let i=0;i<SKULL_ACTUAL;i++){
+    const[x,y,z,r,g,b,a,scl]=all[i];
+    writeSplat(i,x,y,z,scl,r,g,b,a);
+    sk_x[i]=x; sk_y[i]=y; sk_z[i]=z;
+  }
+}
+
+// ── PARTICLE WRITE ────────────────────────────────────────────────────────────
+const psig=4*P_SCALE*P_SCALE;
+const PCOV01=p2h(psig,0),PCOV23=p2h(0,psig),PCOV45=p2h(0,psig);
+
+function writeParticle(slot,i){
+  const a=age[i];
+  const fi=Math.min(1,a/22), fo=Math.min(1,(MAX_AGE-a)/55);
+  const alpha=(fi*fo*242)|0;
+  const spd=Math.sqrt(vx[i]*vx[i]+vy[i]*vy[i]+vz[i]*vz[i]);
+  const t=Math.min(1,spd/.055);
+  const[br,bg,bb]=PATH_RGB[pth[i]];
+  const R=(br+t*(255-br)*.65)|0;
+  const G=(bg+t*(255-bg)*.38)|0;
+  const B=(bb+t*(255-bb)*.18)|0;
+  _fv[0]=px[i];const bx=_iv[0]>>>0;
+  _fv[0]=py[i];const by=_iv[0]>>>0;
+  _fv[0]=pz[i];const bz=_iv[0]>>>0;
+  const base=slot*8;
+  texdata[base]=bx;texdata[base+1]=by;texdata[base+2]=bz;texdata[base+3]=0;
+  texdata[base+4]=PCOV01;texdata[base+5]=PCOV23;texdata[base+6]=PCOV45;
+  texdata[base+7]=(R|(G<<8)|(B<<16)|(alpha<<24))>>>0;
+}
+
+// ── TEXTURE ───────────────────────────────────────────────────────────────────
+const TEXW=2048;
+let texdata;
+
+// ── GLSL ──────────────────────────────────────────────────────────────────────
+const VS=`#version 300 es
+precision highp float; precision highp int;
+uniform highp usampler2D u_texture;
+uniform mat4 projection,view;
+uniform vec2 focal,viewport;
+in vec2 position; in int index;
+out vec4 vColor; out vec2 vPosition;
+void main(){
+  uvec4 cen=texelFetch(u_texture,ivec2((uint(index)&0x3ffu)<<1,uint(index)>>10),0);
+  vec4 cam=view*vec4(uintBitsToFloat(cen.xyz),1.);
+  vec4 p=projection*cam;
+  float clip=1.2*p.w;
+  if(p.z<-clip||p.x<-clip||p.x>clip||p.y<-clip||p.y>clip){gl_Position=vec4(0,0,2,1);return;}
+  uvec4 cov=texelFetch(u_texture,ivec2(((uint(index)&0x3ffu)<<1)|1u,uint(index)>>10),0);
+  vec2 u1=unpackHalf2x16(cov.x),u2=unpackHalf2x16(cov.y),u3=unpackHalf2x16(cov.z);
+  mat3 Vrk=mat3(u1.x,u1.y,u2.x,u1.y,u2.y,u3.x,u2.x,u3.x,u3.y);
+  mat3 J=mat3(focal.x/cam.z,0.,-(focal.x*cam.x)/(cam.z*cam.z),
+              0.,-focal.y/cam.z,(focal.y*cam.y)/(cam.z*cam.z),0.,0.,0.);
+  mat3 T=transpose(mat3(view))*J;
+  mat3 c2=transpose(T)*Vrk*T;
+  float mid=(c2[0][0]+c2[1][1])*.5;
+  float rad=length(vec2((c2[0][0]-c2[1][1])*.5,c2[0][1]));
+  float l1=mid+rad,l2=mid-rad;
+  if(l2<0.)return;
+  vec2 dv=normalize(vec2(c2[0][1],l1-c2[0][0]));
+  vec2 ma=min(sqrt(2.*l1),1024.)*dv;
+  vec2 mi=min(sqrt(2.*l2),1024.)*vec2(dv.y,-dv.x);
+  vColor=clamp(p.z/p.w+1.,0.,1.)*vec4(float(cov.w&0xffu),float((cov.w>>8)&0xffu),
+    float((cov.w>>16)&0xffu),float((cov.w>>24)&0xffu))/255.;
+  vPosition=position;
+  vec2 vc=vec2(p)/p.w;
+  gl_Position=vec4(vc+position.x*ma/viewport+position.y*mi/viewport,0.,1.);
+}`;
+
+const FS=`#version 300 es
+precision highp float;
+in vec4 vColor; in vec2 vPosition;
+out vec4 fragColor;
+void main(){
+  float A=-dot(vPosition,vPosition);
+  if(A<-4.)discard;
+  float B=exp(A)*vColor.a;
+  fragColor=vec4(B*vColor.rgb,B);
+}`;
+
+// ── WEBGL INIT ────────────────────────────────────────────────────────────────
+const canvas=document.getElementById('canvas');
+const gl=canvas.getContext('webgl2',{antialias:false});
+
+function mkSh(t,s){const sh=gl.createShader(t);gl.shaderSource(sh,s);gl.compileShader(sh);
+  if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(sh));return sh;}
+const prog=gl.createProgram();
+gl.attachShader(prog,mkSh(gl.VERTEX_SHADER,VS));
+gl.attachShader(prog,mkSh(gl.FRAGMENT_SHADER,FS));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog,gl.LINK_STATUS))console.error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const ul={proj:gl.getUniformLocation(prog,'projection'),view:gl.getUniformLocation(prog,'view'),
+  focal:gl.getUniformLocation(prog,'focal'),vp:gl.getUniformLocation(prog,'viewport'),
+  tex:gl.getUniformLocation(prog,'u_texture')};
+gl.uniform1i(ul.tex,0);
+
+const quadBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-2,-2,2,-2,2,2,-2,2]),gl.STATIC_DRAW);
+const a_pos=gl.getAttribLocation(prog,'position');
+gl.enableVertexAttribArray(a_pos);
+gl.vertexAttribPointer(a_pos,2,gl.FLOAT,false,0,0);
+
+const idxBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,idxBuf);
+const a_idx=gl.getAttribLocation(prog,'index');
+gl.enableVertexAttribArray(a_idx);
+gl.vertexAttribIPointer(a_idx,1,gl.INT,false,0,0);
+gl.vertexAttribDivisor(a_idx,1);
+
+const tex=gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D,tex);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+gl.activeTexture(gl.TEXTURE0);
+
+gl.enable(gl.BLEND);
+gl.blendFuncSeparate(gl.ONE_MINUS_DST_ALPHA,gl.ONE,gl.ONE_MINUS_DST_ALPHA,gl.ONE);
+gl.disable(gl.DEPTH_TEST);
+
+// ── MATRICES ──────────────────────────────────────────────────────────────────
+function mul4(a,b){return[b[0]*a[0]+b[1]*a[4]+b[2]*a[8]+b[3]*a[12],b[0]*a[1]+b[1]*a[5]+b[2]*a[9]+b[3]*a[13],b[0]*a[2]+b[1]*a[6]+b[2]*a[10]+b[3]*a[14],b[0]*a[3]+b[1]*a[7]+b[2]*a[11]+b[3]*a[15],b[4]*a[0]+b[5]*a[4]+b[6]*a[8]+b[7]*a[12],b[4]*a[1]+b[5]*a[5]+b[6]*a[9]+b[7]*a[13],b[4]*a[2]+b[5]*a[6]+b[6]*a[10]+b[7]*a[14],b[4]*a[3]+b[5]*a[7]+b[6]*a[11]+b[7]*a[15],b[8]*a[0]+b[9]*a[4]+b[10]*a[8]+b[11]*a[12],b[8]*a[1]+b[9]*a[5]+b[10]*a[9]+b[11]*a[13],b[8]*a[2]+b[9]*a[6]+b[10]*a[10]+b[11]*a[14],b[8]*a[3]+b[9]*a[7]+b[10]*a[11]+b[11]*a[15],b[12]*a[0]+b[13]*a[4]+b[14]*a[8]+b[15]*a[12],b[12]*a[1]+b[13]*a[5]+b[14]*a[9]+b[15]*a[13],b[12]*a[2]+b[13]*a[6]+b[14]*a[10]+b[15]*a[14],b[12]*a[3]+b[13]*a[7]+b[14]*a[11]+b[15]*a[15]];}
+function inv4(a){let b00=a[0]*a[5]-a[1]*a[4],b01=a[0]*a[6]-a[2]*a[4],b02=a[0]*a[7]-a[3]*a[4],b03=a[1]*a[6]-a[2]*a[5],b04=a[1]*a[7]-a[3]*a[5],b05=a[2]*a[7]-a[3]*a[6],b06=a[8]*a[13]-a[9]*a[12],b07=a[8]*a[14]-a[10]*a[12],b08=a[8]*a[15]-a[11]*a[12],b09=a[9]*a[14]-a[10]*a[13],b10=a[9]*a[15]-a[11]*a[13],b11=a[10]*a[15]-a[11]*a[14],det=1/(b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06);return[(a[5]*b11-a[6]*b10+a[7]*b09)*det,(a[2]*b10-a[1]*b11-a[3]*b09)*det,(a[13]*b05-a[14]*b04+a[15]*b03)*det,(a[10]*b04-a[9]*b05-a[11]*b03)*det,(a[6]*b08-a[4]*b11-a[7]*b07)*det,(a[0]*b11-a[2]*b08+a[3]*b07)*det,(a[14]*b02-a[12]*b05-a[15]*b01)*det,(a[8]*b05-a[10]*b02+a[11]*b01)*det,(a[4]*b10-a[5]*b08+a[7]*b06)*det,(a[1]*b08-a[0]*b10-a[3]*b06)*det,(a[12]*b04-a[13]*b02+a[15]*b00)*det,(a[9]*b02-a[8]*b04-a[11]*b00)*det,(a[5]*b07-a[4]*b09-a[6]*b06)*det,(a[0]*b09-a[1]*b07+a[2]*b06)*det,(a[13]*b01-a[12]*b03-a[14]*b00)*det,(a[8]*b03-a[9]*b01+a[10]*b00)*det];}
+function tr4(a,x,y,z){return mul4(a,[1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]);}
+
+function orbitPivot(inv,dxR,dyR){
+  const[px,py,pz]=PIVOT;
+  const sx=Math.sin(dxR),cx=Math.cos(dxR),sy=Math.sin(-dyR),cy=Math.cos(-dyR);
+  const Ry=[cx,0,-sx,0,0,1,0,0,sx,0,cx,0,0,0,0,1];
+  const Rx=[1,0,0,0,0,cy,sy,0,0,-sy,cy,0,0,0,0,1];
+  const Tn=[1,0,0,0,0,1,0,0,0,0,1,0,-px,-py,-pz,1];
+  const Tp=[1,0,0,0,0,1,0,0,0,0,1,0,px,py,pz,1];
+  let m=mul4(Tn,inv);m=mul4(Ry,m);m=mul4(Rx,m);return mul4(Tp,m);
+}
+
+// LH convention: forward in col2 un-negated
+function lookAt(ex,ey,ez,cx,cy,cz){
+  const fx=cx-ex,fy=cy-ey,fz=cz-ez,fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
+  const nx=fx/fl,ny=fy/fl,nz=fz/fl;
+  let rx=nz,ry=0,rz=-nx;
+  const rl=Math.sqrt(rx*rx+rz*rz)||1;rx/=rl;rz/=rl;
+  const ux=ny*rz-nz*ry,uy=nz*rx-nx*rz,uz=nx*ry-ny*rx;
+  return[rx,ux,nx,0,ry,uy,ny,0,rz,uz,nz,0,
+    -(rx*ex+ry*ey+rz*ez),-(ux*ex+uy*ey+uz*ez),-(nx*ex+ny*ey+nz*ez),1];
+}
+
+// Default: 3/4 frontal view from in front (Z+), slightly elevated
+let viewMatrix=lookAt(1.2,0.5,5.0, PIVOT[0],PIVOT[1],PIVOT[2]);
+let projMatrix;
+
+function getProj(fx,fy,w,h){const zn=.1,zf=200;
+  return[(2*fx)/w,0,0,0,0,-(2*fy)/h,0,0,0,0,zf/(zf-zn),1,0,0,-(zf*zn)/(zf-zn),0];}
+
+function resize(){
+  canvas.width=innerWidth; canvas.height=innerHeight;
+  gl.viewport(0,0,innerWidth,innerHeight);
+  const fy=innerHeight*1.1,fx=fy;
+  projMatrix=getProj(fx,fy,innerWidth,innerHeight);
+  gl.uniform2f(ul.focal,fx,fy);
+  gl.uniform2f(ul.vp,innerWidth,innerHeight);
+  gl.uniformMatrix4fv(ul.proj,false,projMatrix);
+  // allocate texture buffer: skull slots + particle slots
+  const texH=Math.ceil(2*TOTAL_MAX/TEXW)+2;
+  texdata=new Uint32Array(TEXW*texH*4);
+  initSkull(); // write static skull data into fresh texdata
+}
+window.addEventListener('resize',resize); resize();
+
+// ── ORBIT CONTROLS ────────────────────────────────────────────────────────────
+let sX,sY,drag=false;
+canvas.addEventListener('mousedown',e=>{sX=e.clientX;sY=e.clientY;drag=true;});
+window.addEventListener('mouseup',()=>drag=false);
+window.addEventListener('mousemove',e=>{
+  if(!drag)return;
+  const dx=5*(e.clientX-sX)/innerWidth,dy=5*(e.clientY-sY)/innerHeight;
+  viewMatrix=inv4(orbitPivot(inv4(viewMatrix),dx,dy));sX=e.clientX;sY=e.clientY;
+});
+canvas.addEventListener('wheel',e=>{
+  e.preventDefault();
+  viewMatrix=inv4(tr4(inv4(viewMatrix),0,0,e.deltaY*.008));
+},{passive:false});
+
+let tX,tY,tX2,tY2;
+canvas.addEventListener('touchstart',e=>{e.preventDefault();
+  if(e.touches.length===1){tX=e.touches[0].clientX;tY=e.touches[0].clientY;drag=true;}
+  else{tX=e.touches[0].clientX;tX2=e.touches[1].clientX;tY=e.touches[0].clientY;tY2=e.touches[1].clientY;}
+},{passive:false});
+canvas.addEventListener('touchmove',e=>{e.preventDefault();
+  if(e.touches.length===1&&drag){
+    const dx=4*(e.touches[0].clientX-tX)/innerWidth,dy=4*(e.touches[0].clientY-tY)/innerHeight;
+    viewMatrix=inv4(orbitPivot(inv4(viewMatrix),dx,dy));tX=e.touches[0].clientX;tY=e.touches[0].clientY;
+  }else if(e.touches.length===2){
+    const prev=Math.hypot(tX-tX2,tY-tY2),now=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
+    viewMatrix=inv4(tr4(inv4(viewMatrix),0,0,3*(1-now/prev)));
+    tX=e.touches[0].clientX;tX2=e.touches[1].clientX;tY=e.touches[0].clientY;tY2=e.touches[1].clientY;
+  }
+},{passive:false});
+canvas.addEventListener('touchend',()=>drag=false);
+
+// ── DEPTH SORT + BUILDALL ─────────────────────────────────────────────────────
+const depthBuf=new Float32Array(TOTAL_MAX);
+const sortArr =new Int32Array(TOTAL_MAX);
+
+function buildAll(vp){
+  let r=0;
+
+  // 1. Skull static points (always rendered, pre-written in texdata)
+  for(let i=0;i<SKULL_ACTUAL;i++){
+    depthBuf[i]=vp[2]*sk_x[i]+vp[6]*sk_y[i]+vp[10]*sk_z[i];
+    sortArr[r++]=i;
+  }
+
+  // 2. Live particles packed into slots SKULL_N..SKULL_N+alive-1
+  let pp=SKULL_N;
+  for(let i=0;i<N;i++){
+    if(age[i]<=0) continue;
+    writeParticle(pp,i);
+    depthBuf[pp]=vp[2]*px[i]+vp[6]*py[i]+vp[10]*pz[i];
+    sortArr[r++]=pp;
+    pp++;
+  }
+
+  const total=r;
+  // in-place sort of sortArr[0..total-1] by depth (ascending = back-to-front)
+  sortArr.subarray(0,total).sort((a,b)=>depthBuf[a]-depthBuf[b]);
+  return total;
+}
+
+// ── RENDER LOOP ───────────────────────────────────────────────────────────────
+const fpsEl=document.getElementById('fps');
+let lastT=0,avgFps=60;
+
+function frame(now){
+  requestAnimationFrame(frame);
+  stepPhysics();
+
+  const vp=mul4(projMatrix,viewMatrix);
+  const total=buildAll(vp);
+  if(total===0){gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);return;}
+
+  const texH=Math.ceil(2*total/TEXW)+1;
+  gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32UI,TEXW,texH,0,gl.RGBA_INTEGER,gl.UNSIGNED_INT,
+    new Uint32Array(texdata.buffer,0,TEXW*texH*4));
+
+  const idx32=new Int32Array(total);
+  for(let i=0;i<total;i++) idx32[i]=sortArr[i];
+  gl.bindBuffer(gl.ARRAY_BUFFER,idxBuf);
+  gl.bufferData(gl.ARRAY_BUFFER,idx32,gl.DYNAMIC_DRAW);
+
+  gl.uniformMatrix4fv(ul.view,false,viewMatrix);
+  gl.clearColor(0,0,0,0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArraysInstanced(gl.TRIANGLE_FAN,0,4,total);
+
+  const dt=now-lastT;lastT=now;
+  if(dt>0) avgFps=avgFps*.9+(1000/dt)*.1;
+  let alive=0;for(let i=0;i<N;i++)if(age[i]>0)alive++;
+  fpsEl.textContent=Math.round(avgFps)+' fps · '+SKULL_ACTUAL+' skull · '+alive+' flow';
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
