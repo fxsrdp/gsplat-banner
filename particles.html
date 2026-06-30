@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>S-Orbit · Particle Simulation</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#000; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; }
+    #info { position:fixed; bottom:16px; left:50%; transform:translateX(-50%);
+      font:11px/1 'Helvetica Neue',sans-serif; letter-spacing:.12em;
+      text-transform:uppercase; color:rgba(255,255,255,.25); pointer-events:none; white-space:nowrap; }
+    #fps { position:fixed; top:10px; left:10px; color:rgba(255,255,255,.16); font:10px monospace; }
+    #back { position:fixed; top:14px; left:50%; transform:translateX(-50%);
+      font:11px/1 'Helvetica Neue',sans-serif; letter-spacing:.1em; text-transform:uppercase;
+      color:rgba(255,255,255,.30); text-decoration:none; border:1px solid rgba(255,255,255,.12);
+      padding:4px 12px; border-radius:3px; }
+  </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="fps"></div>
+<div id="info">1 emitter · 3 attractors · S-orbit · drag to rotate</div>
+<a href="nng.html" id="back">← NNG</a>
+<script>
+// ── config ─────────────────────────────────────────────────────────────────
+const N       = 2500;   // max particles
+const EMIT    = 7;      // born per frame
+const MAX_AGE = 350;    // ~5.8s at 60fps
+const SCALE   = 0.065;  // Gaussian radius
+const DAMP    = 0.91;   // velocity damping (high = smooth, slow)
+const G_WP    = 0.009;  // waypoint attraction strength
+const THRESH  = 0.55;   // advance to next waypoint at this distance
+
+// 3 attractor waypoints — diagonal S in XZ, slight Y tilt
+const WP = [
+  [-1.6,  0.35,  1.0],   // A — upper-left
+  [ 0.0,  0.0,   0.0],   // B — center
+  [ 1.6, -0.35, -1.0],   // C — lower-right
+];
+
+// Emitter — left entry of S
+const EM_POS    = [-3.4,  0.0,  0.1];
+const EM_SPREAD = 0.18;
+// Initial velocity aimed toward WP[0]
+const EM_SPEED  = 0.055;
+
+// Camera pivot = centroid of all waypoints
+const PIVOT = WP.reduce((a,p)=>[a[0]+p[0]/3,a[1]+p[1]/3,a[2]+p[2]/3],[0,0,0]);
+
+// ── particle state ──────────────────────────────────────────────────────────
+const px    = new Float32Array(N);
+const py    = new Float32Array(N);
+const pz    = new Float32Array(N);
+const vx    = new Float32Array(N);
+const vy    = new Float32Array(N);
+const vz    = new Float32Array(N);
+const age   = new Int32Array(N);  // 0=dead
+const stage = new Uint8Array(N);  // 0=to A, 1=to B, 2=to C, 3=done
+let cursor  = 0;
+
+function spawn() {
+  for (let k = 0; k < EMIT; k++) {
+    let t = 0;
+    while (age[cursor] > 0 && t++ < N) cursor = (cursor+1)%N;
+    if (age[cursor] > 0) return;
+    const i = cursor; cursor = (cursor+1)%N;
+
+    px[i] = EM_POS[0] + (Math.random()-.5)*EM_SPREAD;
+    py[i] = EM_POS[1] + (Math.random()-.5)*EM_SPREAD*.2;
+    pz[i] = EM_POS[2] + (Math.random()-.5)*EM_SPREAD*.2;
+
+    // Velocity toward WP[0] with jitter
+    const dx=WP[0][0]-px[i], dy=WP[0][1]-py[i], dz=WP[0][2]-pz[i];
+    const r=Math.sqrt(dx*dx+dy*dy+dz*dz);
+    const sp = EM_SPEED * (.7 + Math.random()*.6);
+    vx[i]=dx/r*sp + (Math.random()-.5)*.01;
+    vy[i]=dy/r*sp + (Math.random()-.5)*.005;
+    vz[i]=dz/r*sp + (Math.random()-.5)*.01;
+
+    age[i]=1; stage[i]=0;
+  }
+}
+
+function stepPhysics() {
+  spawn();
+  for (let i = 0; i < N; i++) {
+    if (age[i]<=0) continue;
+    if (++age[i]>MAX_AGE || stage[i]>=3) { age[i]=0; continue; }
+
+    const wp = WP[stage[i]];
+    const dx=wp[0]-px[i], dy=wp[1]-py[i], dz=wp[2]-pz[i];
+    const r2=dx*dx+dy*dy+dz*dz+.04;
+    const r=Math.sqrt(r2);
+
+    if (r < THRESH) { stage[i]++; } // advance to next waypoint
+
+    const f = G_WP / r;
+    vx[i]=(vx[i]+f*dx)*DAMP;
+    vy[i]=(vy[i]+f*dy)*DAMP;
+    vz[i]=(vz[i]+f*dz)*DAMP;
+    px[i]+=vx[i]; py[i]+=vy[i]; pz[i]+=vz[i];
+  }
+}
+
+// ── half-float & covariance ───────────────────────────────────────────────
+const _fv=new Float32Array(1), _iv=new Int32Array(_fv.buffer);
+function f2h(f){_fv[0]=f;const v=_iv[0];const s=(v>>31)&1,e=(v>>23)&0xff,m=v&0x7fffff;if(e===0)return s<<15;if(e===255)return(s<<15)|(31<<10)|(m?1:0);const ne=e-127+15;if(ne>=31)return(s<<15)|(31<<10);if(ne<=0)return s<<15;return(s<<15)|(ne<<10)|(m>>13);}
+function p2h(a,b){return(f2h(a)|(f2h(b)<<16))>>>0;}
+const sig=4*SCALE*SCALE;
+const COV01=p2h(sig,0), COV23=p2h(0,sig), COV45=p2h(0,sig);
+
+// ── texture (RGBA32UI, 2 texels / particle) ───────────────────────────────
+const TEXW=2048;
+let texdata;
+
+function buildTexture() {
+  let w=0;
+  for (let i=0; i<N; i++) {
+    if (age[i]<=0) continue;
+    const a=age[i], st=stage[i];
+    const fadein=Math.min(1,a/30), fadeout=Math.min(1,(MAX_AGE-a)/60);
+    const alpha=fadein*fadeout;
+
+    // Color: faster = brighter/whiter, slower = deeper blue
+    const spd=Math.sqrt(vx[i]*vx[i]+vy[i]*vy[i]+vz[i]*vz[i]);
+    const t=Math.min(1,spd/.08);
+    const R=(60+t*195)|0, G=(110+t*145)|0, B=255;
+    const A=(alpha*240)|0;
+
+    _fv[0]=px[i];const bx=_iv[0]>>>0;
+    _fv[0]=py[i];const by=_iv[0]>>>0;
+    _fv[0]=pz[i];const bz=_iv[0]>>>0;
+
+    const b=w*8;
+    texdata[b]=bx; texdata[b+1]=by; texdata[b+2]=bz; texdata[b+3]=0;
+    texdata[b+4]=COV01; texdata[b+5]=COV23; texdata[b+6]=COV45;
+    texdata[b+7]=(R|(G<<8)|(B<<16)|(A<<24))>>>0;
+    w++;
+  }
+  return w;
+}
+
+// ── attractor splats (rendered as large glowing nodes) ───────────────────
+const ATT_SCALE = 0.18;
+const attsig=4*ATT_SCALE*ATT_SCALE;
+const ACOV01=p2h(attsig,0), ACOV23=p2h(0,attsig), ACOV45=p2h(0,attsig);
+
+function appendAttractors(w) {
+  for (let k=0; k<WP.length; k++) {
+    _fv[0]=WP[k][0];const bx=_iv[0]>>>0;
+    _fv[0]=WP[k][1];const by=_iv[0]>>>0;
+    _fv[0]=WP[k][2];const bz=_iv[0]>>>0;
+    const b=w*8;
+    texdata[b]=bx; texdata[b+1]=by; texdata[b+2]=bz; texdata[b+3]=0;
+    texdata[b+4]=ACOV01; texdata[b+5]=ACOV23; texdata[b+6]=ACOV45;
+    // Bright blue-white node
+    const R=160,G=200,B=255,A=200;
+    texdata[b+7]=(R|(G<<8)|(B<<16)|(A<<24))>>>0;
+    w++;
+  }
+  return w;
+}
+
+// ── depth sort (JS sort, fast for <3000) ─────────────────────────────────
+const depthBuf = new Float32Array(N+4);
+let sortArr = new Int32Array(N+4);
+
+function depthSort(total, vp) {
+  sortArr = new Int32Array(total);
+  for(let i=0;i<total;i++){sortArr[i]=i;}
+  // depthBuf must be filled before calling (done in buildAll)
+  sortArr.sort((a,b)=>depthBuf[a]-depthBuf[b]);
+}
+
+function buildAll(vp) {
+  let w = buildTexture();
+  w = appendAttractors(w);
+  const total = w;
+  // Fill depthBuf for all entries
+  let r=0;
+  for(let i=0;i<N;i++){
+    if(age[i]<=0) continue;
+    depthBuf[r++]=vp[2]*px[i]+vp[6]*py[i]+vp[10]*pz[i];
+  }
+  for(let k=0;k<WP.length;k++){
+    depthBuf[r++]=vp[2]*WP[k][0]+vp[6]*WP[k][1]+vp[10]*WP[k][2];
+  }
+  depthSort(total, vp);
+  return total;
+}
+
+// ── GLSL shaders (same Gaussian splat pipeline) ───────────────────────────
+const VS = `#version 300 es
+precision highp float; precision highp int;
+uniform highp usampler2D u_texture;
+uniform mat4 projection, view;
+uniform vec2 focal, viewport;
+in vec2 position; in int index;
+out vec4 vColor; out vec2 vPosition;
+void main(){
+  uvec4 cen=texelFetch(u_texture,ivec2((uint(index)&0x3ffu)<<1,uint(index)>>10),0);
+  vec4 cam=view*vec4(uintBitsToFloat(cen.xyz),1);
+  vec4 p=projection*cam;
+  float clip=1.2*p.w;
+  if(p.z<-clip||p.x<-clip||p.x>clip||p.y<-clip||p.y>clip){gl_Position=vec4(0,0,2,1);return;}
+  uvec4 cov=texelFetch(u_texture,ivec2(((uint(index)&0x3ffu)<<1)|1u,uint(index)>>10),0);
+  vec2 u1=unpackHalf2x16(cov.x),u2=unpackHalf2x16(cov.y),u3=unpackHalf2x16(cov.z);
+  mat3 Vrk=mat3(u1.x,u1.y,u2.x,u1.y,u2.y,u3.x,u2.x,u3.x,u3.y);
+  mat3 J=mat3(focal.x/cam.z,0.,-(focal.x*cam.x)/(cam.z*cam.z),
+              0.,-focal.y/cam.z,(focal.y*cam.y)/(cam.z*cam.z),0.,0.,0.);
+  mat3 T=transpose(mat3(view))*J;
+  mat3 c2=transpose(T)*Vrk*T;
+  float mid=(c2[0][0]+c2[1][1])*.5;
+  float rad=length(vec2((c2[0][0]-c2[1][1])*.5,c2[0][1]));
+  float l1=mid+rad,l2=mid-rad;
+  if(l2<0.)return;
+  vec2 dv=normalize(vec2(c2[0][1],l1-c2[0][0]));
+  vec2 ma=min(sqrt(2.*l1),1024.)*dv;
+  vec2 mi=min(sqrt(2.*l2),1024.)*vec2(dv.y,-dv.x);
+  vColor=clamp(p.z/p.w+1.,0.,1.)*vec4(float(cov.w&0xffu),float((cov.w>>8)&0xffu),float((cov.w>>16)&0xffu),float((cov.w>>24)&0xffu))/255.;
+  vPosition=position;
+  vec2 vc=vec2(p)/p.w;
+  gl_Position=vec4(vc+position.x*ma/viewport+position.y*mi/viewport,0.,1.);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec4 vColor; in vec2 vPosition;
+out vec4 fragColor;
+void main(){
+  float A=-dot(vPosition,vPosition);
+  if(A<-4.)discard;
+  float B=exp(A)*vColor.a;
+  fragColor=vec4(B*vColor.rgb,B);
+}`;
+
+// ── WebGL init ─────────────────────────────────────────────────────────────
+const canvas=document.getElementById('canvas');
+const gl=canvas.getContext('webgl2',{antialias:false});
+
+function mkSh(t,s){const sh=gl.createShader(t);gl.shaderSource(sh,s);gl.compileShader(sh);if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(sh));return sh;}
+const prog=gl.createProgram();
+gl.attachShader(prog,mkSh(gl.VERTEX_SHADER,VS));
+gl.attachShader(prog,mkSh(gl.FRAGMENT_SHADER,FS));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog,gl.LINK_STATUS))console.error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const ul={proj:gl.getUniformLocation(prog,'projection'),view:gl.getUniformLocation(prog,'view'),focal:gl.getUniformLocation(prog,'focal'),vp:gl.getUniformLocation(prog,'viewport'),tex:gl.getUniformLocation(prog,'u_texture')};
+gl.uniform1i(ul.tex,0);
+
+const quadBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-2,-2,2,-2,2,2,-2,2]),gl.STATIC_DRAW);
+const a_pos=gl.getAttribLocation(prog,'position');
+gl.enableVertexAttribArray(a_pos);
+gl.vertexAttribPointer(a_pos,2,gl.FLOAT,false,0,0);
+
+const idxBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,idxBuf);
+const a_idx=gl.getAttribLocation(prog,'index');
+gl.enableVertexAttribArray(a_idx);
+gl.vertexAttribIPointer(a_idx,1,gl.INT,false,0,0);
+gl.vertexAttribDivisor(a_idx,1);
+
+const tex=gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D,tex);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+gl.activeTexture(gl.TEXTURE0);
+
+gl.enable(gl.BLEND);
+gl.blendFuncSeparate(gl.ONE_MINUS_DST_ALPHA,gl.ONE,gl.ONE_MINUS_DST_ALPHA,gl.ONE);
+gl.disable(gl.DEPTH_TEST);
+
+// ── matrix helpers ─────────────────────────────────────────────────────────
+function mul4(a,b){return[b[0]*a[0]+b[1]*a[4]+b[2]*a[8]+b[3]*a[12],b[0]*a[1]+b[1]*a[5]+b[2]*a[9]+b[3]*a[13],b[0]*a[2]+b[1]*a[6]+b[2]*a[10]+b[3]*a[14],b[0]*a[3]+b[1]*a[7]+b[2]*a[11]+b[3]*a[15],b[4]*a[0]+b[5]*a[4]+b[6]*a[8]+b[7]*a[12],b[4]*a[1]+b[5]*a[5]+b[6]*a[9]+b[7]*a[13],b[4]*a[2]+b[5]*a[6]+b[6]*a[10]+b[7]*a[14],b[4]*a[3]+b[5]*a[7]+b[6]*a[11]+b[7]*a[15],b[8]*a[0]+b[9]*a[4]+b[10]*a[8]+b[11]*a[12],b[8]*a[1]+b[9]*a[5]+b[10]*a[9]+b[11]*a[13],b[8]*a[2]+b[9]*a[6]+b[10]*a[10]+b[11]*a[14],b[8]*a[3]+b[9]*a[7]+b[10]*a[11]+b[11]*a[15],b[12]*a[0]+b[13]*a[4]+b[14]*a[8]+b[15]*a[12],b[12]*a[1]+b[13]*a[5]+b[14]*a[9]+b[15]*a[13],b[12]*a[2]+b[13]*a[6]+b[14]*a[10]+b[15]*a[14],b[12]*a[3]+b[13]*a[7]+b[14]*a[11]+b[15]*a[15]];}
+function inv4(a){let b00=a[0]*a[5]-a[1]*a[4],b01=a[0]*a[6]-a[2]*a[4],b02=a[0]*a[7]-a[3]*a[4],b03=a[1]*a[6]-a[2]*a[5],b04=a[1]*a[7]-a[3]*a[5],b05=a[2]*a[7]-a[3]*a[6],b06=a[8]*a[13]-a[9]*a[12],b07=a[8]*a[14]-a[10]*a[12],b08=a[8]*a[15]-a[11]*a[12],b09=a[9]*a[14]-a[10]*a[13],b10=a[9]*a[15]-a[11]*a[13],b11=a[10]*a[15]-a[11]*a[14],det=1/(b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06);return[(a[5]*b11-a[6]*b10+a[7]*b09)*det,(a[2]*b10-a[1]*b11-a[3]*b09)*det,(a[13]*b05-a[14]*b04+a[15]*b03)*det,(a[10]*b04-a[9]*b05-a[11]*b03)*det,(a[6]*b08-a[4]*b11-a[7]*b07)*det,(a[0]*b11-a[2]*b08+a[3]*b07)*det,(a[14]*b02-a[12]*b05-a[15]*b01)*det,(a[8]*b05-a[10]*b02+a[11]*b01)*det,(a[4]*b10-a[5]*b08+a[7]*b06)*det,(a[1]*b08-a[0]*b10-a[3]*b06)*det,(a[12]*b04-a[13]*b02+a[15]*b00)*det,(a[9]*b02-a[8]*b04-a[11]*b00)*det,(a[5]*b07-a[4]*b09-a[6]*b06)*det,(a[0]*b09-a[1]*b07+a[2]*b06)*det,(a[13]*b01-a[12]*b03-a[14]*b00)*det,(a[8]*b03-a[9]*b01+a[10]*b00)*det];}
+function tr4(a,x,y,z){return mul4(a,[1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]);}
+
+function orbitPivot(inv,dxR,dyR){
+  const[px,py,pz]=PIVOT;
+  const sx=Math.sin(dxR),cx=Math.cos(dxR),sy=Math.sin(-dyR),cy=Math.cos(-dyR);
+  const Ry=[cx,0,-sx,0,0,1,0,0,sx,0,cx,0,0,0,0,1];
+  const Rx=[1,0,0,0,0,cy,sy,0,0,-sy,cy,0,0,0,0,1];
+  const Tn=[1,0,0,0,0,1,0,0,0,0,1,0,-px,-py,-pz,1];
+  const Tp=[1,0,0,0,0,1,0,0,0,0,1,0,px,py,pz,1];
+  let m=mul4(Tn,inv);m=mul4(Ry,m);m=mul4(Rx,m);return mul4(Tp,m);
+}
+
+// Look-at for LH convention (antimatter15 uses p.w = +cam.z, so forward goes in col2 un-negated)
+function lookAt(ex,ey,ez,cx,cy,cz){
+  const fx=cx-ex,fy=cy-ey,fz=cz-ez,fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
+  const nx=fx/fl,ny=fy/fl,nz=fz/fl; // forward = normalize(center-eye)
+  // right = cross(world_up=(0,1,0), forward)
+  let rx=1*nz-0*ny,ry=0*nx-0*nz,rz=0*ny-1*nx; // = (nz, 0, -nx)
+  const rl=Math.sqrt(rx*rx+ry*ry+rz*rz);rx/=rl;ry/=rl;rz/=rl;
+  const ux=ny*rz-nz*ry,uy=nz*rx-nx*rz,uz=nx*ry-ny*rx; // up = cross(forward, right)
+  return[rx,ux,nx,0,ry,uy,ny,0,rz,uz,nz,0,
+    -(rx*ex+ry*ey+rz*ez),-(ux*ex+uy*ey+uz*ez),-(nx*ex+ny*ey+nz*ez),1];
+}
+
+let viewMatrix = lookAt(0.5, 6.0, -9.0, PIVOT[0], PIVOT[1]+0.2, PIVOT[2]);
+
+function getProj(fx,fy,w,h){const zn=.1,zf=200;return[(2*fx)/w,0,0,0,0,-(2*fy)/h,0,0,0,0,zf/(zf-zn),1,0,0,-(zf*zn)/(zf-zn),0];}
+let projMatrix;
+
+function resize(){
+  canvas.width=innerWidth; canvas.height=innerHeight;
+  gl.viewport(0,0,innerWidth,innerHeight);
+  const fy=innerHeight*1.1, fx=fy;
+  projMatrix=getProj(fx,fy,innerWidth,innerHeight);
+  gl.uniform2f(ul.focal,fx,fy); gl.uniform2f(ul.vp,innerWidth,innerHeight);
+  gl.uniformMatrix4fv(ul.proj,false,projMatrix);
+  texdata=new Uint32Array(TEXW*Math.ceil(2*(N+4)/TEXW)*4);
+}
+window.addEventListener('resize',resize); resize();
+
+// ── orbit controls ─────────────────────────────────────────────────────────
+let sX,sY,drag=false;
+canvas.addEventListener('mousedown',e=>{sX=e.clientX;sY=e.clientY;drag=true;});
+window.addEventListener('mouseup',()=>drag=false);
+window.addEventListener('mousemove',e=>{
+  if(!drag)return;
+  const dx=5*(e.clientX-sX)/innerWidth,dy=5*(e.clientY-sY)/innerHeight;
+  viewMatrix=inv4(orbitPivot(inv4(viewMatrix),dx,dy));sX=e.clientX;sY=e.clientY;
+});
+canvas.addEventListener('wheel',e=>{e.preventDefault();viewMatrix=inv4(tr4(inv4(viewMatrix),0,0,e.deltaY*.008));},{passive:false});
+
+let tX,tY,tX2,tY2;
+canvas.addEventListener('touchstart',e=>{e.preventDefault();
+  if(e.touches.length===1){tX=e.touches[0].clientX;tY=e.touches[0].clientY;drag=true;}
+  else{tX=e.touches[0].clientX;tX2=e.touches[1].clientX;tY=e.touches[0].clientY;tY2=e.touches[1].clientY;}
+},{passive:false});
+canvas.addEventListener('touchmove',e=>{e.preventDefault();
+  if(e.touches.length===1&&drag){
+    const dx=4*(e.touches[0].clientX-tX)/innerWidth,dy=4*(e.touches[0].clientY-tY)/innerHeight;
+    viewMatrix=inv4(orbitPivot(inv4(viewMatrix),dx,dy));tX=e.touches[0].clientX;tY=e.touches[0].clientY;
+  }else if(e.touches.length===2){
+    const prev=Math.hypot(tX-tX2,tY-tY2),now=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
+    viewMatrix=inv4(tr4(inv4(viewMatrix),0,0,3*(1-now/prev)));
+    tX=e.touches[0].clientX;tX2=e.touches[1].clientX;tY=e.touches[0].clientY;tY2=e.touches[1].clientY;
+  }
+},{passive:false});
+canvas.addEventListener('touchend',()=>drag=false);
+
+// ── render loop ─────────────────────────────────────────────────────────────
+const fpsEl=document.getElementById('fps');
+let lastT=0,avgFps=60;
+
+function frame(now){
+  requestAnimationFrame(frame);
+  stepPhysics();
+
+  const viewProj=mul4(projMatrix,viewMatrix);
+  const total=buildAll(viewProj);
+  if(total===0){gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);return;}
+
+  const texH=Math.ceil(2*total/TEXW);
+  gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32UI,TEXW,texH,0,gl.RGBA_INTEGER,gl.UNSIGNED_INT,
+    new Uint32Array(texdata.buffer,0,TEXW*texH*4));
+
+  const idx32=new Int32Array(total);
+  for(let i=0;i<total;i++) idx32[i]=sortArr[i];
+  gl.bindBuffer(gl.ARRAY_BUFFER,idxBuf);
+  gl.bufferData(gl.ARRAY_BUFFER,idx32,gl.DYNAMIC_DRAW);
+
+  gl.uniformMatrix4fv(ul.view,false,viewMatrix);
+  gl.clearColor(0,0,0,0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArraysInstanced(gl.TRIANGLE_FAN,0,4,total);
+
+  const dt=now-lastT;lastT=now;
+  if(dt>0) avgFps=avgFps*.9+(1000/dt)*.1;
+  fpsEl.textContent=Math.round(avgFps)+' fps · '+total+' pts';
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
