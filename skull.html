@@ -54,12 +54,16 @@ const EXHALE_RGB = [255, 140, 50];
 const PIVOT = [0, 0.05, 0.3];
 
 // ── AIRWAY PATHS ─────────────────────────────────────────────────────────────
+// Inhale: nostril → nasal cavity → sinus
 const PATHS = [
   [[0.04,-0.27,0.73],[0,-0.13,0.55],[ 0.10,0.03,0.22],[ 0.35,-0.07,0.25]],
   [[-0.04,-0.27,0.73],[0,-0.13,0.55],[-0.10,0.03,0.22],[-0.35,-0.07,0.25]],
   [[0,-0.27,0.73],[0,-0.05,0.50],[0.08,0.12,0.37],[ 0.20,0.52,0.47]],
   [[0,-0.27,0.73],[0, 0.05,0.48],[0,0.12,0.30],[0,0.17,-0.03]],
 ];
+// Exhale: sinus → nasal cavity → nostril (reversed)
+const EXHALE_PATHS = PATHS.map(p => [...p].reverse());
+
 const PATH_W    = [0.38, 0.38, 0.14, 0.10];
 const PATH_CUMW = (() => { let s=0; return PATH_W.map(w=>s+=w); })();
 
@@ -69,7 +73,8 @@ const vx=new Float32Array(N), vy=new Float32Array(N), vz=new Float32Array(N);
 const age       = new Int32Array(N);
 const stage     = new Uint8Array(N);
 const pth       = new Uint8Array(N);
-const driftLife = new Int32Array(N);   // exhale-drift countdown (>0 = drifting)
+const dir       = new Uint8Array(N);   // 0=inhale (blue), 1=exhale (orange)
+const driftLife = new Int32Array(N);   // exhale downward-fade after nostril exit
 let cursor=0;
 
 function pickPath(){
@@ -78,26 +83,30 @@ function pickPath(){
   return PATH_CUMW.length-1;
 }
 
+function spawnOne(isExhale){
+  let t=0;
+  while(age[cursor]>0 && t++<N) cursor=(cursor+1)%N;
+  if(age[cursor]>0) return;
+  const i=cursor; cursor=(cursor+1)%N;
+  const p=pickPath();
+  const wps=isExhale ? EXHALE_PATHS[p] : PATHS[p];
+  const w0=wps[0];
+  px[i]=w0[0]+(Math.random()-.5)*.07;
+  py[i]=w0[1]+(Math.random()-.5)*.04;
+  pz[i]=w0[2]+(Math.random()-.5)*.04;
+  const w1=wps[1];
+  const dx=w1[0]-px[i],dy=w1[1]-py[i],dz=w1[2]-pz[i];
+  const r=Math.sqrt(dx*dx+dy*dy+dz*dz)||1;
+  const sp=0.016*(0.7+Math.random()*.6);
+  vx[i]=dx/r*sp+(Math.random()-.5)*.009;
+  vy[i]=dy/r*sp+(Math.random()-.5)*.005;
+  vz[i]=dz/r*sp+(Math.random()-.5)*.009;
+  age[i]=1; stage[i]=0; pth[i]=p; dir[i]=isExhale?1:0; driftLife[i]=0;
+}
+
 function spawn(){
-  for(let k=0;k<EMIT;k++){
-    let t=0;
-    while(age[cursor]>0 && t++<N) cursor=(cursor+1)%N;
-    if(age[cursor]>0) return;
-    const i=cursor; cursor=(cursor+1)%N;
-    const p=pickPath();
-    const w0=PATHS[p][0];
-    px[i]=w0[0]+(Math.random()-.5)*.07;
-    py[i]=w0[1]+(Math.random()-.5)*.04;
-    pz[i]=w0[2]+(Math.random()-.5)*.04;
-    const w1=PATHS[p][1];
-    const dx=w1[0]-px[i],dy=w1[1]-py[i],dz=w1[2]-pz[i];
-    const r=Math.sqrt(dx*dx+dy*dy+dz*dz)||1;
-    const sp=0.016*(0.7+Math.random()*.6);
-    vx[i]=dx/r*sp+(Math.random()-.5)*.009;
-    vy[i]=dy/r*sp+(Math.random()-.5)*.005;
-    vz[i]=dz/r*sp+(Math.random()-.5)*.009;
-    age[i]=1; stage[i]=0; pth[i]=p; driftLife[i]=0;
-  }
+  for(let k=0;k<EMIT;k++) spawnOne(false);  // inhale stream
+  for(let k=0;k<EMIT;k++) spawnOne(true);   // exhale stream
 }
 
 function stepPhysics(){
@@ -106,29 +115,33 @@ function stepPhysics(){
     if(age[i]<=0) continue;
     age[i]++;
 
-    // ── Exhale drift (after sinus path complete) ──────────────────────────────
+    // ── Exhale: downward drift after leaving nostril ───────────────────────────
     if(driftLife[i]>0){
-      vy[i] -= 0.0018;        // gravity
-      vx[i] *= 0.95;
-      vy[i] *= 0.97;
-      vz[i] *= 0.95;
+      vy[i] -= 0.0020;
+      vx[i] *= 0.95; vy[i] *= 0.97; vz[i] *= 0.96;
       px[i]+=vx[i]; py[i]+=vy[i]; pz[i]+=vz[i];
       driftLife[i]--;
       if(driftLife[i]<=0){ age[i]=0; driftLife[i]=0; }
       continue;
     }
 
-    // ── Inhale: follow sinus path ─────────────────────────────────────────────
-    const wps=PATHS[pth[i]];
+    const wps = dir[i]===1 ? EXHALE_PATHS[pth[i]] : PATHS[pth[i]];
+
     if(stage[i]>=wps.length){
-      // Enter exhale drift with random lifetime
-      driftLife[i]=(45+Math.random()*90)|0;
-      vx[i]+=(Math.random()-.5)*.008;
-      vy[i]-=0.004;
-      vz[i]+=(Math.random()-.5)*.008;
+      if(dir[i]===1){
+        // Exhale done: drift downward past nose and fade
+        driftLife[i]=(50+Math.random()*85)|0;
+        vx[i]+=(Math.random()-.5)*.010;
+        vy[i]-=0.006;
+        vz[i]+=(Math.random()-.5)*.010;
+      } else {
+        // Inhale done: particle reached sinus, die
+        age[i]=0;
+      }
       continue;
     }
     if(age[i]>MAX_AGE){ age[i]=0; continue; }
+
     const wp=wps[stage[i]];
     const dx=wp[0]-px[i],dy=wp[1]-py[i],dz=wp[2]-pz[i];
     const r=Math.sqrt(dx*dx+dy*dy+dz*dz+.015);
@@ -312,16 +325,16 @@ const psig=4*P_SCALE*P_SCALE;
 const PCOV01=p2h(psig,0),PCOV23=p2h(0,psig),PCOV45=p2h(0,psig);
 
 function writeParticle(slot,i){
-  const inDrift=driftLife[i]>0;
   let alpha;
-  if(inDrift){
-    alpha=(Math.min(1,driftLife[i]/30)*195)|0;
+  if(driftLife[i]>0){
+    // Exhale tail: fade as it exits downward
+    alpha=(Math.min(1,driftLife[i]/35)*195)|0;
   } else {
     const a=age[i];
     const fi=Math.min(1,a/22), fo=Math.min(1,(MAX_AGE-a)/55);
     alpha=(fi*fo*242)|0;
   }
-  const [br,bg,bb]=inDrift ? EXHALE_RGB : INHALE_RGB;
+  const [br,bg,bb]=dir[i]===1 ? EXHALE_RGB : INHALE_RGB;
   const spd=Math.sqrt(vx[i]*vx[i]+vy[i]*vy[i]+vz[i]*vz[i]);
   const t=Math.min(1,spd/.045);
   const R=(br+t*(255-br)*.50)|0;
